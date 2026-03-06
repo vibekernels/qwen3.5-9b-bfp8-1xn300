@@ -198,6 +198,161 @@ static void handle_health(const httplib::Request&, httplib::Response& res) {
     res.set_content(R"({"status":"ok"})", "application/json");
 }
 
+static const char* CHAT_HTML = R"html(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3.5-9B Chat</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
+header { padding: 12px 20px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+header h1 { font-size: 16px; font-weight: 600; }
+header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2px 8px; border-radius: 12px; }
+#chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.msg { max-width: 780px; width: 100%; margin: 0 auto; display: flex; gap: 12px; }
+.msg.user { justify-content: flex-end; }
+.msg .bubble { padding: 10px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-width: 85%; font-size: 14px; }
+.msg.user .bubble { background: #1f6feb; color: #fff; border-bottom-right-radius: 4px; }
+.msg.assistant .bubble { background: #161b22; border: 1px solid #30363d; border-bottom-left-radius: 4px; }
+.msg.assistant .bubble code { background: #0d1117; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.msg.assistant .bubble pre { background: #0d1117; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+.msg.assistant .bubble pre code { background: none; padding: 0; }
+#input-area { padding: 12px 20px 20px; border-top: 1px solid #30363d; flex-shrink: 0; }
+#input-row { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; }
+#prompt { flex: 1; background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 10px 14px; border-radius: 8px; font-size: 14px; font-family: inherit; resize: none; outline: none; min-height: 44px; max-height: 200px; }
+#prompt:focus { border-color: #1f6feb; }
+#prompt::placeholder { color: #484f58; }
+#send { background: #1f6feb; color: #fff; border: none; padding: 0 20px; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 500; white-space: nowrap; }
+#send:hover { background: #388bfd; }
+#send:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+.typing { display: inline-block; }
+.typing::after { content: '\25CF'; animation: blink 1s infinite; }
+@keyframes blink { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
+#settings { display: flex; gap: 12px; max-width: 780px; margin: 0 auto 8px; align-items: center; font-size: 12px; color: #8b949e; }
+#settings label { display: flex; align-items: center; gap: 4px; }
+#settings input, #settings select { background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 12px; width: 70px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwen3.5-9B</h1>
+  <span class="model">BF16 &bull; CUDA</span>
+</header>
+<div id="chat"></div>
+<div id="input-area">
+  <div id="settings">
+    <label>Temp <input type="number" id="temp" value="0.7" min="0" max="2" step="0.1"></label>
+    <label>Max tokens <input type="number" id="max-tok" value="1024" min="1" max="4096" step="64"></label>
+    <button id="clear-btn" style="background:none;border:1px solid #30363d;color:#8b949e;padding:2px 10px;border-radius:4px;cursor:pointer;font-size:12px;">Clear</button>
+  </div>
+  <div id="input-row">
+    <textarea id="prompt" rows="1" placeholder="Send a message..." autofocus></textarea>
+    <button id="send">Send</button>
+  </div>
+</div>
+<script>
+const chat = document.getElementById('chat');
+const prompt = document.getElementById('prompt');
+const sendBtn = document.getElementById('send');
+const clearBtn = document.getElementById('clear-btn');
+let messages = [];
+let generating = false;
+
+function autoResize() {
+  prompt.style.height = 'auto';
+  prompt.style.height = Math.min(prompt.scrollHeight, 200) + 'px';
+}
+prompt.addEventListener('input', autoResize);
+
+function addMessage(role, content) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = content;
+  div.appendChild(bubble);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return bubble;
+}
+
+async function send() {
+  const text = prompt.value.trim();
+  if (!text || generating) return;
+
+  generating = true;
+  sendBtn.disabled = true;
+  prompt.value = '';
+  autoResize();
+
+  messages.push({ role: 'user', content: text });
+  addMessage('user', text);
+
+  const bubble = addMessage('assistant', '');
+  bubble.innerHTML = '<span class="typing"></span>';
+
+  const temp = parseFloat(document.getElementById('temp').value) || 0.7;
+  const maxTok = parseInt(document.getElementById('max-tok').value) || 1024;
+
+  let fullText = '';
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'qwen3.5-9b', messages, stream: true, temperature: temp, max_tokens: maxTok })
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        try {
+          const obj = JSON.parse(line.slice(6));
+          const delta = obj.choices?.[0]?.delta;
+          if (delta?.content) {
+            fullText += delta.content;
+            bubble.textContent = fullText;
+            chat.scrollTop = chat.scrollHeight;
+          }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    fullText = 'Error: ' + e.message;
+    bubble.textContent = fullText;
+  }
+
+  messages.push({ role: 'assistant', content: fullText });
+  generating = false;
+  sendBtn.disabled = false;
+  prompt.focus();
+}
+
+sendBtn.addEventListener('click', send);
+prompt.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+clearBtn.addEventListener('click', () => {
+  messages = [];
+  chat.innerHTML = '';
+  prompt.focus();
+});
+</script>
+</body>
+</html>
+)html";
+
 int main(int argc, char** argv) {
     std::string model_path;
     std::string host = "0.0.0.0";
@@ -242,11 +397,15 @@ int main(int argc, char** argv) {
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(CHAT_HTML, "text/html");
+    });
     svr.Post("/v1/chat/completions", handle_chat_completions);
     svr.Get("/v1/models", handle_models);
     svr.Get("/health", handle_health);
 
     printf("Server listening on %s:%d\n", host.c_str(), port);
+    printf("  GET  /                    Chat UI\n");
     printf("  POST /v1/chat/completions\n");
     printf("  GET  /v1/models\n");
     printf("  GET  /health\n");
