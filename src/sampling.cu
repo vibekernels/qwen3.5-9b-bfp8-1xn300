@@ -72,6 +72,21 @@ static int gpu_argmax(float* logits_device, int vocab_size) {
     return result;
 }
 
+// Argmax on a specific stream (avoids sync gap when used with CUDA graphs)
+int gpu_argmax_on_stream(float* logits_device, int vocab_size, cudaStream_t stream) {
+    if (!g_argmax_result) {
+        g_argmax_result = cuda_alloc<int>(1);
+        g_argmax_val = cuda_alloc<float>(1);
+    }
+    int threads = 1024;
+    size_t smem = threads * (sizeof(float) + sizeof(int));
+    argmax_kernel<<<1, threads, smem, stream>>>(g_argmax_result, g_argmax_val, logits_device, vocab_size);
+    // D2H copy on same stream; pageable memory makes this synchronous (waits for stream)
+    int result;
+    cudaMemcpy(&result, g_argmax_result, sizeof(int), cudaMemcpyDeviceToHost);
+    return result;
+}
+
 // Simple CPU-side sampling (good enough for single-token generation)
 int sample_token(float* logits_device, int vocab_size, float temperature, int top_k, float top_p) {
     // Greedy (argmax) for temperature <= 0 — done on GPU

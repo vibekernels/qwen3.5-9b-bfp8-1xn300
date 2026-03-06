@@ -1,6 +1,6 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 2 Complete (Optimized — Faster than llama.cpp)
+## Status: Phase 3 Complete (CUDA Graphs — Further optimized)
 
 Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on both prompt eval and generation.
 
@@ -8,9 +8,8 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
-| Prompt eval (111 tok) | **1480 tok/s** | 651 tok/s | **2.27×** |
-| Prompt eval (211 tok) | **1099 tok/s** | 1041 tok/s | **1.06×** |
-| Generation | **83.5 tok/s** | 75.3 tok/s | **1.11×** |
+| Prompt eval (94 tok) | **1835 tok/s** | 563 tok/s | **3.26×** |
+| Generation | **86.4 tok/s** | 78.2 tok/s | **1.10×** |
 
 ## Phase 2 Optimizations Applied
 
@@ -34,6 +33,12 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 - **M≤4**: Direct bf16→f32 output (decode path, saves cast)
 - **M>4**: bf16→bf16 GEMM + fused bf16→f32 cast in downstream kernel (faster cuBLAS kernels)
 - **cuBLAS warm-up**: Pre-warm cuBLAS workspace before timing
+
+### CUDA Graph Decode (Phase 3)
+- **Full decode graph capture**: Entire decode forward pass captured as CUDA graph on first token, replayed for all subsequent tokens
+- **Device-side kv_len**: Attention kernels read kv_len from device memory so graph stays valid as kv_len changes
+- **Named compute stream**: All operations routed through a non-default stream for graph capture compatibility
+- **Stream-aware argmax**: Greedy sampling runs on compute stream, avoiding sync gap between graph and sampling
 
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)

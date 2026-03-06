@@ -78,13 +78,111 @@ void launch_fused_ssm_step_batched(__nv_bfloat16* output, float* state,
 
 using MC = ModelConfig;
 
+// Custom GEMV: y[N] = W[N,K] @ x[K], bf16 weights × bf16 input → bf16 output
+// Each warp processes 4 output rows simultaneously, reusing x from L1/L2 cache.
+// 8 warps/block = 32 rows/block.
+__global__ void custom_gemv_bf16_kernel(
+    __nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ W,  // [N, K] row-major
+    const __nv_bfloat16* __restrict__ x,  // [K]
+    int N, int K
+) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int base_row = blockIdx.x * 32 + warp_id * 4;
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    bool r0 = base_row < N, r1 = base_row+1 < N, r2 = base_row+2 < N, r3 = base_row+3 < N;
+
+    for (int k = lane_id; k < K; k += 32) {
+        float xv = __bfloat162float(x[k]);
+        if (r0) sum0 += __bfloat162float(W[(int64_t)(base_row)*K + k]) * xv;
+        if (r1) sum1 += __bfloat162float(W[(int64_t)(base_row+1)*K + k]) * xv;
+        if (r2) sum2 += __bfloat162float(W[(int64_t)(base_row+2)*K + k]) * xv;
+        if (r3) sum3 += __bfloat162float(W[(int64_t)(base_row+3)*K + k]) * xv;
+    }
+
+    // Warp reduction for all 4 sums
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
+    }
+
+    if (lane_id == 0) {
+        if (r0) y[base_row]   = __float2bfloat16(sum0);
+        if (r1) y[base_row+1] = __float2bfloat16(sum1);
+        if (r2) y[base_row+2] = __float2bfloat16(sum2);
+        if (r3) y[base_row+3] = __float2bfloat16(sum3);
+    }
+}
+
+// Custom GEMV with f32 output
+__global__ void custom_gemv_bf16_f32out_kernel(
+    float* __restrict__ y,
+    const __nv_bfloat16* __restrict__ W,
+    const __nv_bfloat16* __restrict__ x,
+    int N, int K
+) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int base_row = blockIdx.x * 32 + warp_id * 4;
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    bool r0 = base_row < N, r1 = base_row+1 < N, r2 = base_row+2 < N, r3 = base_row+3 < N;
+
+    for (int k = lane_id; k < K; k += 32) {
+        float xv = __bfloat162float(x[k]);
+        if (r0) sum0 += __bfloat162float(W[(int64_t)(base_row)*K + k]) * xv;
+        if (r1) sum1 += __bfloat162float(W[(int64_t)(base_row+1)*K + k]) * xv;
+        if (r2) sum2 += __bfloat162float(W[(int64_t)(base_row+2)*K + k]) * xv;
+        if (r3) sum3 += __bfloat162float(W[(int64_t)(base_row+3)*K + k]) * xv;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
+    }
+
+    if (lane_id == 0) {
+        if (r0) y[base_row]   = sum0;
+        if (r1) y[base_row+1] = sum1;
+        if (r2) y[base_row+2] = sum2;
+        if (r3) y[base_row+3] = sum3;
+    }
+}
+
+static void launch_gemv_bf16(__nv_bfloat16* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
+    int N, int K, cudaStream_t stream) {
+    int blocks = cdiv(N, 32);
+    custom_gemv_bf16_kernel<<<blocks, 256, 0, stream>>>(y, W, x, N, K);
+}
+
+static void launch_gemv_bf16_f32out(float* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
+    int N, int K, cudaStream_t stream) {
+    int blocks = cdiv(N, 32);
+    custom_gemv_bf16_f32out_kernel<<<blocks, 256, 0, stream>>>(y, W, x, N, K);
+}
+
+// Flag to enable/disable custom GEMV (set via env var CUSTOM_GEMV=1)
+static bool g_use_custom_gemv = false;
+
 // cuBLAS GEMM wrapper: C = A @ B^T  (row-major), bf16 output
 // A: [M, K] bf16, B: [N, K] bf16, C: [M, N] bf16
+static cudaStream_t g_compute_stream = 0;  // set from model.compute_stream
+
 static void gemm_bf16(
     cublasHandle_t handle,
     __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K
 ) {
+    if (M == 1 && g_use_custom_gemv) {
+        launch_gemv_bf16(C, B, A, N, K, g_compute_stream);
+        return;
+    }
     float alpha = 1.0f, beta_val = 0.0f;
     CUBLAS_CHECK(cublasGemmEx(
         handle,
@@ -123,6 +221,10 @@ static void gemm_bf16_f32out(
     float* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K
 ) {
+    if (M == 1 && g_use_custom_gemv) {
+        launch_gemv_bf16_f32out(C, B, A, N, K, g_compute_stream);
+        return;
+    }
     float alpha = 1.0f, beta_val = 0.0f;
 
     if (M <= 4) {
@@ -324,6 +426,8 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     model.d_kv_len = cuda_alloc<int>(2);
     CUDA_CHECK(cudaStreamCreate(&model.compute_stream));
     cublasSetStream(model.cublas_handle, model.compute_stream);
+    g_compute_stream = model.compute_stream;
+    g_use_custom_gemv = (getenv("CUSTOM_GEMV") != nullptr);
     model.decode_graph = nullptr;
     model.decode_graph_exec = nullptr;
     model.decode_graph_captured = false;
@@ -599,18 +703,18 @@ static int forward_decode(Model& model, int token_id, int position) {
         CUDA_CHECK(cudaStreamEndCapture(s, &model.decode_graph));
         CUDA_CHECK(cudaGraphInstantiate(&model.decode_graph_exec, model.decode_graph, nullptr, nullptr, 0));
         model.decode_graph_captured = true;
-
-        // Launch the captured graph (capture doesn't execute)
         CUDA_CHECK(cudaGraphLaunch(model.decode_graph_exec, s));
     } else {
-        // Replay the captured graph
+        // Subsequent decodes: replay the captured graph
         CUDA_CHECK(cudaGraphLaunch(model.decode_graph_exec, s));
     }
 
-    // Update KV cache position (CPU-side)
     model.kv_len += 1;
 
-    // Sync and sample (outside graph)
+    // Sample: for greedy, launch argmax on compute_stream (avoids sync gap)
+    if (g_temperature <= 0.0f) {
+        return gpu_argmax_on_stream(model.logits_f32, MC::n_vocab, s);
+    }
     CUDA_CHECK(cudaStreamSynchronize(s));
     return sample_token(model.logits_f32, MC::n_vocab, g_temperature);
 }

@@ -10,3 +10,6 @@ void launch_bf16_to_f32(float* output, const __nv_bfloat16* input, int n, cudaSt
 // Returns the sampled token ID
 int sample_token(float* logits_device, int vocab_size, float temperature = 0.8f,
                  int top_k = 40, float top_p = 0.95f);
+
+// Greedy argmax on a specific stream (for CUDA graph decode path)
+int gpu_argmax_on_stream(float* logits_device, int vocab_size, cudaStream_t stream);
