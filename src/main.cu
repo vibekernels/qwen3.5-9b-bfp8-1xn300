@@ -1152,6 +1152,21 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     }
 
     if (stop_reason) *stop_reason = reason;
+
+    if (g_profile && generated > 0) {
+        double total = g_prof.embedding_ms + g_prof.norm_ms + g_prof.attn_gemm_ms +
+            g_prof.attn_kernel_ms + g_prof.ssm_gemm_ms + g_prof.ssm_conv_ms +
+            g_prof.ssm_step_ms + g_prof.ffn_gate_up_ms + g_prof.ffn_down_ms +
+            g_prof.ffn_kernel_ms + g_prof.lm_head_ms;
+        fprintf(stderr, "Profile (%d tokens): total=%.1fms (%.1f tok/s)\n", generated, total, generated / (total / 1000.0));
+        fprintf(stderr, "  attn_gemm=%.1f attn_kernel=%.1f ssm_gemm=%.1f ssm_conv=%.1f ssm_step=%.1f\n",
+            g_prof.attn_gemm_ms, g_prof.attn_kernel_ms, g_prof.ssm_gemm_ms, g_prof.ssm_conv_ms, g_prof.ssm_step_ms);
+        fprintf(stderr, "  ffn_gate_up=%.1f ffn_down=%.1f ffn_kernel=%.1f norm=%.1f lm_head=%.1f embd=%.1f\n",
+            g_prof.ffn_gate_up_ms, g_prof.ffn_down_ms, g_prof.ffn_kernel_ms, g_prof.norm_ms, g_prof.lm_head_ms, g_prof.embedding_ms);
+        // Reset for next request
+        g_prof = ProfileTimers{};
+    }
+
     return generated;
 }
 
