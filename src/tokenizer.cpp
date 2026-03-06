@@ -110,7 +110,19 @@ bool Tokenizer::load(const std::string& gguf_path) {
         merge_rank_[pair_key] = (int)i;
     }
 
-    printf("Tokenizer loaded: %zu tokens, %zu merges\n", id_to_token_.size(), merges_.size());
+    // Build special tokens list (tokens containing <| and |>)
+    // Sorted longest-first so greedy matching works correctly
+    for (size_t i = 0; i < id_to_token_.size(); i++) {
+        const auto& tok = id_to_token_[i];
+        if (tok.size() >= 4 && tok.find("<|") != std::string::npos && tok.find("|>") != std::string::npos) {
+            special_tokens_.emplace_back(tok, (int)i);
+        }
+    }
+    std::sort(special_tokens_.begin(), special_tokens_.end(),
+        [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
+    printf("Tokenizer loaded: %zu tokens, %zu merges, %zu special tokens\n",
+        id_to_token_.size(), merges_.size(), special_tokens_.size());
     return true;
 }
 
@@ -151,7 +163,8 @@ static std::string byte_to_unicode(unsigned char b) {
     return table[b];
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text) const {
+// Encode a segment of plain text (no special tokens) using BPE
+std::vector<int> Tokenizer::encode_segment(const std::string& text) const {
     if (text.empty()) return {};
 
     // Step 1: Convert each byte to its GPT-2 unicode representation
@@ -164,7 +177,6 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<std::string> tokens;
     size_t i = 0;
     while (i < unicode_text.size()) {
-        // Find longest matching token from vocabulary
         bool found = false;
         size_t max_len = std::min(unicode_text.size() - i, (size_t)64);
         for (size_t len = max_len; len >= 1; len--) {
@@ -178,7 +190,6 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         }
 
         if (!found) {
-            // Single character token
             tokens.push_back(unicode_text.substr(i, 1));
             i++;
         }
@@ -196,6 +207,49 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         } else {
             fprintf(stderr, "Warning: unknown token '%s' (len=%zu)\n", tok.c_str(), tok.size());
         }
+    }
+
+    return ids;
+}
+
+std::vector<int> Tokenizer::encode(const std::string& text) const {
+    if (text.empty()) return {};
+
+    // Split text around special tokens, encode segments normally, insert special IDs
+    std::vector<int> ids;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Check if any special token matches at current position
+        bool found_special = false;
+        for (const auto& [tok_str, tok_id] : special_tokens_) {
+            if (pos + tok_str.size() <= text.size() &&
+                text.compare(pos, tok_str.size(), tok_str) == 0) {
+                // Encode any text before this special token
+                if (pos > 0) {
+                    // Already handled by previous iteration
+                }
+                ids.push_back(tok_id);
+                pos += tok_str.size();
+                found_special = true;
+                break;
+            }
+        }
+        if (found_special) continue;
+
+        // Find the next special token
+        size_t next_special = text.size();
+        for (const auto& [tok_str, tok_id] : special_tokens_) {
+            size_t p = text.find(tok_str, pos);
+            if (p != std::string::npos && p < next_special) {
+                next_special = p;
+            }
+        }
+
+        // Encode the plain text segment before next special token
+        std::string segment = text.substr(pos, next_special - pos);
+        auto seg_ids = encode_segment(segment);
+        ids.insert(ids.end(), seg_ids.begin(), seg_ids.end());
+        pos = next_special;
     }
 
     return ids;

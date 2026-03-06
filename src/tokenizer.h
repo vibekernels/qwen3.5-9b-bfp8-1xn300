@@ -10,6 +10,7 @@ public:
     bool load(const std::string& gguf_path);
 
     std::vector<int> encode(const std::string& text) const;
+    std::vector<int> encode_segment(const std::string& text) const;
     std::string decode(int token_id) const;
     std::string decode(const std::vector<int>& token_ids) const;
 
@@ -24,6 +25,9 @@ private:
 
     int eos_id_ = 248046;  // <|im_end|>
     int bos_id_ = -1;      // Qwen doesn't use BOS
+
+    // Special tokens: string -> token ID (for tokens like <|im_start|>)
+    std::vector<std::pair<std::string, int>> special_tokens_;
 
     // BPE merge ranking (pair -> priority, lower = higher priority)
     std::unordered_map<std::string, int> merge_rank_;

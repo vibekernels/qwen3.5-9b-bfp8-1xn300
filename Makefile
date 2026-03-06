@@ -4,15 +4,14 @@ CXX = g++
 # RTX 5090 = SM 12.0
 CUDA_ARCH = -gencode arch=compute_120,code=sm_120
 
-NVCC_FLAGS = $(CUDA_ARCH) -O3 -std=c++17 --use_fast_math -Xcompiler -Wall
-LDFLAGS = -lcudart
+NVCC_FLAGS = $(CUDA_ARCH) -O3 -std=c++17 --use_fast_math -Xcompiler -Wall -Ithird_party
+LDFLAGS = -lcudart -lpthread
 
 BUILD_DIR = build
 SRC_DIR = src
 
-# Source files
+# Source files (shared between CLI and server)
 CU_SOURCES = \
-    $(SRC_DIR)/main.cu \
     $(SRC_DIR)/sampling.cu \
     $(SRC_DIR)/kernels/rmsnorm.cu \
     $(SRC_DIR)/kernels/embedding.cu \
@@ -28,16 +27,41 @@ CPP_SOURCES = \
 # Object files
 CU_OBJECTS = $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(CU_SOURCES))
 CPP_OBJECTS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(CPP_SOURCES))
-ALL_OBJECTS = $(CU_OBJECTS) $(CPP_OBJECTS)
+SHARED_OBJECTS = $(CU_OBJECTS) $(CPP_OBJECTS)
 
-TARGET = qwen-inference
+# CLI: main.cu with CLI main()
+# Server: main.cu with -DQWEN_SERVER_BUILD (no CLI main) + server.cu
+MAIN_CLI_OBJ = $(BUILD_DIR)/main.o
+MAIN_SERVER_OBJ = $(BUILD_DIR)/main_server.o
+SERVER_OBJ = $(BUILD_DIR)/server.o
+
+CLI_TARGET = qwen-inference
+SERVER_TARGET = qwen-server
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(CLI_TARGET) $(SERVER_TARGET)
 
-$(TARGET): $(ALL_OBJECTS)
+$(CLI_TARGET): $(SHARED_OBJECTS) $(MAIN_CLI_OBJ)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(SERVER_TARGET): $(SHARED_OBJECTS) $(MAIN_SERVER_OBJ) $(SERVER_OBJ)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+
+# main.cu for CLI (includes CLI main())
+$(MAIN_CLI_OBJ): $(SRC_DIR)/main.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+# main.cu for server (excludes CLI main())
+$(MAIN_SERVER_OBJ): $(SRC_DIR)/main.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCC_FLAGS) -DQWEN_SERVER_BUILD -c -o $@ $<
+
+# server.cu (server main() + HTTP routes)
+$(SERVER_OBJ): $(SRC_DIR)/server.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCC_FLAGS) -DQWEN_SERVER_BUILD -c -o $@ $<
 
 # CUDA source compilation
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cu
@@ -50,4 +74,4 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(NVCC) $(NVCC_FLAGS) -x cu -c -o $@ $<
 
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(CLI_TARGET) $(SERVER_TARGET)

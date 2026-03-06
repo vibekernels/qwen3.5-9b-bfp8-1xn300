@@ -3,6 +3,7 @@
 #include "gguf_loader.h"
 #include "tokenizer.h"
 #include "sampling.h"
+#include "inference.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -13,6 +14,12 @@
 #include <numeric>
 #include <algorithm>
 #include <chrono>
+
+// Global model and tokenizer (shared between CLI and server)
+static Model g_model;
+static Tokenizer g_tokenizer;
+static bool g_loaded = false;
+static int g_max_ctx = 0;
 
 // Forward declarations for kernel launchers
 // (embedding_to_f32 is defined inline in this file)
@@ -406,7 +413,6 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     model.norm_out_f32 = cuda_alloc<float>(max_batch * MC::n_embd);
     model.attn_out     = cuda_alloc<__nv_bfloat16>(max_batch * MC::n_embd);
     int gemm_max = MC::n_ff > MC::n_embd ? MC::n_ff : MC::n_embd;
-    gemm_max = gemm_max > MC::n_vocab ? gemm_max : MC::n_vocab;
     // n_head * head_dim * 2 = 8192, ssm_conv_channels = 8192 - use max
     int qkv_max = MC::n_head * MC::head_dim * 2 + 2 * MC::n_head_kv * MC::head_dim;  // 10240 for packed Q+Gate+K+V
     if (MC::ssm_conv_channels > qkv_max) qkv_max = MC::ssm_conv_channels;
@@ -420,7 +426,7 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     // SSM f32 projection buffer for conv state precision
     model.ssm_proj_f32 = cuda_alloc<float>(max_batch * MC::ssm_conv_channels);
 
-    model.logits_f32 = cuda_alloc<float>(max_batch * MC::n_vocab);
+    model.logits_f32 = cuda_alloc<float>(MC::n_vocab);  // only 1 token at a time
 
     // KV caches for attention layers
     int kv_dim = MC::n_head_kv * MC::head_dim;
@@ -942,10 +948,155 @@ static int forward_decode(Model& model, int token_id, int position) {
     return sample_token(model.logits_f32, MC::n_vocab, g_temperature);
 }
 
+// ============================================================================
+// Inference API (used by both CLI and server)
+// ============================================================================
+
+bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
+    if (g_loaded) return true;
+
+    if (!g_tokenizer.load(model_path)) {
+        fprintf(stderr, "Failed to load tokenizer\n");
+        return false;
+    }
+
+    memset(&g_model, 0, sizeof(g_model));
+    if (!load_model(model_path, g_model)) {
+        fprintf(stderr, "Failed to load model\n");
+        return false;
+    }
+
+    g_max_ctx = max_ctx;
+    allocate_buffers(g_model, max_ctx, max_ctx);
+
+    // Warm up GPU kernels
+    {
+        __nv_bfloat16* dummy_a = g_model.norm_out;
+        __nv_bfloat16* dummy_c = g_model.attn_out;
+        gemm_bf16(dummy_c, dummy_a, g_model.ssm_layers[0].ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
+        gemm_bf16(g_model.ffn_buf, dummy_c, g_model.ssm_layers[0].ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+        gemm_bf16(dummy_c, g_model.ffn_buf, g_model.ssm_layers[0].ffn_down, 1, MC::n_embd, MC::n_ff);
+        gemm_bf16_f32out(g_model.logits_f32, dummy_a, g_model.output, 1, MC::n_vocab, MC::n_embd);
+        CUDA_CHECK(cudaStreamSynchronize(g_model.compute_stream));
+    }
+
+    g_loaded = true;
+    return true;
+}
+
+void reset_state() {
+    // Zero KV caches
+    int kv_dim = MC::n_head_kv * MC::head_dim;
+    for (int i = 0; i < 8; i++) {
+        CUDA_CHECK(cudaMemset(g_model.k_cache[i], 0, g_model.max_kv_len * kv_dim * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(g_model.v_cache[i], 0, g_model.max_kv_len * kv_dim * sizeof(__nv_bfloat16)));
+    }
+
+    // Zero SSM states
+    int conv_state_size = (MC::ssm_conv_kernel - 1) * MC::ssm_conv_channels;
+    int recurrent_state_size = MC::ssm_dt_rank * MC::ssm_head_v_dim * MC::ssm_head_v_dim;
+    for (int i = 0; i < 24; i++) {
+        CUDA_CHECK(cudaMemset(g_model.ssm_conv_state[i], 0, conv_state_size * sizeof(float)));
+        CUDA_CHECK(cudaMemset(g_model.ssm_recurrent_state[i], 0, recurrent_state_size * sizeof(float)));
+    }
+
+    g_model.kv_len = 0;
+
+    // Invalidate CUDA graph
+    if (g_model.decode_graph_captured) {
+        if (g_model.decode_graph_exec) {
+            cudaGraphExecDestroy(g_model.decode_graph_exec);
+            g_model.decode_graph_exec = nullptr;
+        }
+        if (g_model.decode_graph) {
+            cudaGraphDestroy(g_model.decode_graph);
+            g_model.decode_graph = nullptr;
+        }
+        g_model.decode_graph_captured = false;
+    }
+}
+
+Tokenizer& get_tokenizer() {
+    return g_tokenizer;
+}
+
+int generate(const std::vector<int>& prompt_tokens, int max_tokens,
+             float temperature, TokenCallback cb, StopReason* stop_reason) {
+    g_temperature = temperature;
+
+    int n_prompt = (int)prompt_tokens.size();
+    int next_token = -1;
+
+    // Prefill
+    {
+        cudaStream_t s = g_model.compute_stream;
+
+        int* tokens_d = cuda_alloc<int>(n_prompt);
+        int* pos_d = cuda_alloc<int>(n_prompt);
+        cuda_upload(tokens_d, prompt_tokens.data(), n_prompt);
+        std::vector<int> positions(n_prompt);
+        for (int i = 0; i < n_prompt; i++) positions[i] = g_model.kv_len + i;
+        cuda_upload(pos_d, positions.data(), n_prompt);
+
+        int kv_params[2] = { g_model.kv_len, g_model.kv_len + n_prompt };
+        cuda_upload(g_model.d_kv_len, kv_params, 2);
+
+        embedding_to_f32_kernel<<<n_prompt, 1024, 0, s>>>(
+            g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
+
+        for (int il = 0; il < MC::n_layers; il++) {
+            if (MC::is_recurrent(il)) {
+                forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, n_prompt);
+            } else {
+                forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, n_prompt, pos_d);
+            }
+        }
+
+        g_model.kv_len += n_prompt;
+
+        float* last_hidden = g_model.hidden_state + (n_prompt - 1) * MC::n_embd;
+        launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
+            1, MC::n_embd, MC::rms_norm_eps, s);
+        gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,
+            1, MC::n_vocab, MC::n_embd);
+
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        next_token = sample_token(g_model.logits_f32, MC::n_vocab, g_temperature);
+
+        cudaFree(tokens_d);
+        cudaFree(pos_d);
+    }
+
+    // Decode loop
+    int generated = 0;
+    StopReason reason = STOP_LENGTH;
+    for (int i = 0; i < max_tokens; i++) {
+        if (next_token == g_tokenizer.eos_token_id()) {
+            reason = STOP_EOS;
+            break;
+        }
+
+        std::string tok_str = g_tokenizer.decode(next_token);
+        generated++;
+
+        if (cb && !cb(next_token, tok_str)) {
+            reason = STOP_CALLBACK;
+            break;
+        }
+
+        int pos = g_model.kv_len;
+        next_token = forward_decode(g_model, next_token, pos);
+    }
+
+    if (stop_reason) *stop_reason = reason;
+    return generated;
+}
+
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s -m <model_path> -p <prompt> [-n <max_tokens>] [-t <temperature>]\n", prog);
 }
 
+#ifndef QWEN_SERVER_BUILD
 int main(int argc, char** argv) {
     std::string model_path;
     std::string prompt;
@@ -962,7 +1113,6 @@ int main(int argc, char** argv) {
             max_gen_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             temperature = atof(argv[++i]);
-            g_temperature = temperature;
         }
     }
 
@@ -978,12 +1128,14 @@ int main(int argc, char** argv) {
     printf("Max tokens: %d\n", max_gen_tokens);
     printf("Temperature: %.2f\n\n", temperature);
 
-    // Load tokenizer
-    Tokenizer tokenizer;
-    if (!tokenizer.load(model_path)) {
-        fprintf(stderr, "Failed to load tokenizer\n");
+    int max_ctx = (int)prompt.size() + max_gen_tokens + 256;
+    if (max_ctx < 4096) max_ctx = 4096;
+
+    if (!load_model_and_tokenizer(model_path.c_str(), max_ctx)) {
         return 1;
     }
+
+    auto& tokenizer = get_tokenizer();
 
     // Tokenize prompt
     std::vector<int> prompt_tokens = tokenizer.encode(prompt);
@@ -991,152 +1143,27 @@ int main(int argc, char** argv) {
     for (int t : prompt_tokens) printf("%d ", t);
     printf("\n\n");
 
-    // Load model
-    Model model;
-    memset(&model, 0, sizeof(model));
-    if (!load_model(model_path, model)) {
-        fprintf(stderr, "Failed to load model\n");
-        return 1;
-    }
-
-    // Allocate buffers (max_batch = prompt size for batched prefill)
-    int max_batch = (int)prompt_tokens.size();
-    if (max_batch < 1) max_batch = 1;
-    int max_kv_len = (int)prompt_tokens.size() + max_gen_tokens + 16;
-    allocate_buffers(model, max_batch, max_kv_len);
-
-    // Warm up GPU kernels on compute stream
-    {
-        __nv_bfloat16* dummy_a = model.norm_out;
-        __nv_bfloat16* dummy_c = model.attn_out;
-        // Warm up GEMV with representative sizes
-        gemm_bf16(dummy_c, dummy_a, model.ssm_layers[0].ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
-        gemm_bf16(model.ffn_buf, dummy_c, model.ssm_layers[0].ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
-        gemm_bf16(dummy_c, model.ffn_buf, model.ssm_layers[0].ffn_down, 1, MC::n_embd, MC::n_ff);
-        gemm_bf16_f32out(model.logits_f32, dummy_a, model.output, 1, MC::n_vocab, MC::n_embd);
-        CUDA_CHECK(cudaStreamSynchronize(model.compute_stream));
-    }
-
-    printf("\nGenerating...\n");
-
-    // Batched prefill: process all prompt tokens through each layer together
-    auto t_start = std::chrono::high_resolution_clock::now();
-
-    int n_prompt = (int)prompt_tokens.size();
-    int next_token = -1;
-    {
-        cudaStream_t s = model.compute_stream;
-
-        // Upload all token IDs and positions
-        int* tokens_d = cuda_alloc<int>(n_prompt);
-        int* pos_d = cuda_alloc<int>(n_prompt);
-        cuda_upload(tokens_d, prompt_tokens.data(), n_prompt);
-        std::vector<int> positions(n_prompt);
-        for (int i = 0; i < n_prompt; i++) positions[i] = i;
-        cuda_upload(pos_d, positions.data(), n_prompt);
-
-        // Upload kv_len for attention layers (kv_len=0 at start)
-        int kv_params[2] = { model.kv_len, model.kv_len + n_prompt };
-        cuda_upload(model.d_kv_len, kv_params, 2);
-
-        // Embedding lookup for all prompt tokens -> f32 hidden state
-        embedding_to_f32_kernel<<<n_prompt, 1024, 0, s>>>(
-            model.hidden_state, model.tok_embd, tokens_d, MC::n_embd);
-
-        // Process all layers with batched tokens
-        for (int il = 0; il < MC::n_layers; il++) {
-            if (MC::is_recurrent(il)) {
-                forward_ssm_layer(model, il, model.layer_subidx[il], model.hidden_state, n_prompt);
-            } else {
-                forward_attention_layer(model, il, model.layer_subidx[il], model.hidden_state, n_prompt, pos_d);
-            }
-        }
-
-        // Update KV cache position
-        model.kv_len += n_prompt;
-
-        // Final norm on last token only
-        float* last_hidden = model.hidden_state + (n_prompt - 1) * MC::n_embd;
-        launch_rmsnorm_f32in(model.norm_out, last_hidden, model.output_norm,
-            1, MC::n_embd, MC::rms_norm_eps, s);
-
-        // LM head on last token
-        gemm_bf16_f32out(model.logits_f32, model.norm_out, model.output,
-            1, MC::n_vocab, MC::n_embd);
-
-        CUDA_CHECK(cudaStreamSynchronize(s));
-        next_token = sample_token(model.logits_f32, MC::n_vocab, g_temperature);
-
-        cudaFree(tokens_d);
-        cudaFree(pos_d);
-    }
-
-    auto t_prompt = std::chrono::high_resolution_clock::now();
-    double prompt_ms = std::chrono::duration<double, std::milli>(t_prompt - t_start).count();
-
-    // Print prompt
+    printf("Generating...\n");
     printf("%s", prompt.c_str());
     fflush(stdout);
 
-    // Generate tokens
-    std::vector<int> generated;
-    auto t_gen_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < max_gen_tokens; i++) {
-        if (next_token == tokenizer.eos_token_id()) break;
-
-        generated.push_back(next_token);
-        std::string tok_str = tokenizer.decode(next_token);
-        printf("%s", tok_str.c_str());
-        fflush(stdout);
-
-        int pos = (int)prompt_tokens.size() + i;
-        next_token = forward_decode(model, next_token, pos);
-    }
+    int n_generated = generate(prompt_tokens, max_gen_tokens, temperature,
+        [](int token_id, const std::string& text) -> bool {
+            printf("%s", text.c_str());
+            fflush(stdout);
+            return true;
+        });
 
     auto t_end = std::chrono::high_resolution_clock::now();
-    double gen_ms = std::chrono::duration<double, std::milli>(t_end - t_gen_start).count();
+    double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
     printf("\n\n--- Performance ---\n");
-    printf("Prompt tokens: %zu (%.1f ms, %.1f tok/s)\n",
-        prompt_tokens.size(), prompt_ms,
-        prompt_tokens.size() * 1000.0 / prompt_ms);
-    printf("Generated tokens: %zu (%.1f ms, %.1f tok/s)\n",
-        generated.size(), gen_ms,
-        generated.size() * 1000.0 / gen_ms);
+    printf("Prompt tokens: %zu\n", prompt_tokens.size());
+    printf("Generated tokens: %d (%.1f ms, %.1f tok/s)\n",
+        n_generated, total_ms, n_generated * 1000.0 / total_ms);
 
-    if (g_profile && g_profile_tokens > 0) {
-        int n = g_profile_tokens;
-        double ffn_gemm = g_prof.ffn_gate_up_ms + g_prof.ffn_down_ms;
-        double total = g_prof.attn_gemm_ms + g_prof.attn_kernel_ms + g_prof.ssm_gemm_ms +
-            g_prof.ssm_conv_ms + g_prof.ssm_step_ms + ffn_gemm + g_prof.ffn_kernel_ms +
-            g_prof.lm_head_ms + g_prof.norm_ms + g_prof.embedding_ms;
-        double gemm_total = g_prof.attn_gemm_ms + g_prof.ssm_gemm_ms + ffn_gemm + g_prof.lm_head_ms;
-        printf("\n--- Profile (%d tokens, %.1f ms total, %.1f ms/tok) ---\n", n, total, total / n);
-        printf("  FFN gate+up:  %7.1f ms (%5.1f%%, %.2f ms/tok)  [32×, N=24576 K=4096]\n", g_prof.ffn_gate_up_ms, 100*g_prof.ffn_gate_up_ms/total, g_prof.ffn_gate_up_ms/n);
-        printf("  FFN down:     %7.1f ms (%5.1f%%, %.2f ms/tok)  [32×, N=4096 K=12288]\n", g_prof.ffn_down_ms, 100*g_prof.ffn_down_ms/total, g_prof.ffn_down_ms/n);
-        printf("  SSM GEMM:     %7.1f ms (%5.1f%%, %.2f ms/tok)  [24× combined+out]\n", g_prof.ssm_gemm_ms, 100*g_prof.ssm_gemm_ms/total, g_prof.ssm_gemm_ms/n);
-        printf("  LM head:      %7.1f ms (%5.1f%%, %.2f ms/tok)  [1×, N=248320 K=4096]\n", g_prof.lm_head_ms, 100*g_prof.lm_head_ms/total, g_prof.lm_head_ms/n);
-        printf("  Attn GEMM:    %7.1f ms (%5.1f%%, %.2f ms/tok)  [8× wq+wkv+wo]\n", g_prof.attn_gemm_ms, 100*g_prof.attn_gemm_ms/total, g_prof.attn_gemm_ms/n);
-        printf("  SSM conv:     %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ssm_conv_ms, 100*g_prof.ssm_conv_ms/total, g_prof.ssm_conv_ms/n);
-        printf("  SSM step:     %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ssm_step_ms, 100*g_prof.ssm_step_ms/total, g_prof.ssm_step_ms/n);
-        printf("  Norms:        %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.norm_ms, 100*g_prof.norm_ms/total, g_prof.norm_ms/n);
-        printf("  Attn kernels: %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.attn_kernel_ms, 100*g_prof.attn_kernel_ms/total, g_prof.attn_kernel_ms/n);
-        printf("  FFN kernels:  %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ffn_kernel_ms, 100*g_prof.ffn_kernel_ms/total, g_prof.ffn_kernel_ms/n);
-        printf("  Embedding:    %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.embedding_ms, 100*g_prof.embedding_ms/total, g_prof.embedding_ms/n);
-        printf("  ---\n");
-        printf("  GEMM total:   %7.1f ms (%5.1f%%, %.2f ms/tok)\n", gemm_total, 100*gemm_total/total, gemm_total/n);
-        // Bandwidth calculation
-        double weight_bytes = (
-            32.0 * (24576 + 4096) * 4096 +  // FFN gate_up + down (all layers)
-            24.0 * (12352 + 4096) * 4096 +  // SSM combined + out
-            8.0 * (8192 + 2048 + 4096) * 4096 +  // Attn wq + wkv + wo
-            248320.0 * 4096  // LM head
-        ) * 2;  // bf16 = 2 bytes
-        printf("  Weight bytes:  %.1f MB/tok, BW util: %.0f%% of 1792 GB/s\n",
-            weight_bytes / 1e6, 100.0 * weight_bytes / (gemm_total / n / 1000.0) / 1.792e12);
-    }
-
-    free_model(model);
     return 0;
 }
+#endif // QWEN_SERVER_BUILD
