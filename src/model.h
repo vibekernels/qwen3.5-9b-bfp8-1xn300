@@ -50,6 +50,7 @@ struct AttentionLayerWeights {
     __nv_bfloat16* wk;               // [n_embd, n_head_kv * head_dim] = [4096, 1024]
     __nv_bfloat16* wv;               // [n_embd, n_head_kv * head_dim] = [4096, 1024]
     __nv_bfloat16* wkv;              // packed K+V [n_embd, 2 * n_head_kv * head_dim] = [4096, 2048]
+    __nv_bfloat16* wqkv;             // packed Q+Gate+K+V [n_embd, n_head*head_dim*2 + 2*n_head_kv*head_dim] = [4096, 10240]
     __nv_bfloat16* wo;               // [n_head * head_dim, n_embd] = [4096, 4096]
     float*         attn_q_norm;      // [head_dim] = [256] (F32 in GGUF)
     float*         attn_k_norm;      // [head_dim] = [256] (F32 in GGUF)

@@ -295,8 +295,10 @@ bool load_model(const std::string& path, Model& model) {
     fclose(f);
 
     // Pack attention K+V weights for fused GEMM
+    // Also pack Q+Gate+K+V into single wqkv for decode (saves 1 cuBLAS call per layer)
     {
         int kv_dim = ModelConfig::n_head_kv * ModelConfig::head_dim;  // 1024
+        int q_dim = ModelConfig::n_head * ModelConfig::head_dim * 2;  // 8192 (Q+Gate)
         int k = ModelConfig::n_embd;
         for (int il = 0; il < ModelConfig::n_layers; il++) {
             if (ModelConfig::is_recurrent(il)) continue;
@@ -307,6 +309,14 @@ bool load_model(const std::string& path, Model& model) {
                 (size_t)kv_dim * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
             CUDA_CHECK(cudaMemcpy(lw.wkv + (size_t)kv_dim * k, lw.wv,
                 (size_t)kv_dim * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+
+            // Pack wqkv = [Q+Gate(8192) | K+V(2048)] = [10240, 4096]
+            int qkv_dim = q_dim + 2 * kv_dim;  // 10240
+            lw.wqkv = cuda_alloc<__nv_bfloat16>((size_t)qkv_dim * k);
+            CUDA_CHECK(cudaMemcpy(lw.wqkv, lw.wq,
+                (size_t)q_dim * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(lw.wqkv + (size_t)q_dim * k, lw.wkv,
+                (size_t)(2 * kv_dim) * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
         }
     }
 

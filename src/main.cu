@@ -392,7 +392,7 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     int gemm_max = MC::n_ff > MC::n_embd ? MC::n_ff : MC::n_embd;
     gemm_max = gemm_max > MC::n_vocab ? gemm_max : MC::n_vocab;
     // n_head * head_dim * 2 = 8192, ssm_conv_channels = 8192 - use max
-    int qkv_max = MC::n_head * MC::head_dim * 2;
+    int qkv_max = MC::n_head * MC::head_dim * 2 + 2 * MC::n_head_kv * MC::head_dim;  // 10240 for packed Q+Gate+K+V
     if (MC::ssm_conv_channels > qkv_max) qkv_max = MC::ssm_conv_channels;
     model.gemm_out     = cuda_alloc<float>(max_batch * gemm_max);
     model.gemm_out2    = cuda_alloc<float>(max_batch * gemm_max);
@@ -479,21 +479,20 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
         launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
     }
 
-    // 2. Q+Gate projection: [n_tokens, 4096] -> [n_tokens, 8192]
-    gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, n_tokens, MC::n_head * MC::head_dim * 2, MC::n_embd);
-
     int kv_dim = MC::n_head_kv * MC::head_dim;
+    int q_gate_dim = MC::n_head * MC::head_dim * 2;
     __nv_bfloat16* k_proj;
     __nv_bfloat16* v_proj;
 
     if (n_tokens == 1) {
-        // Decode: packed K+V GEMM saves 1 cuBLAS launch
-        __nv_bfloat16* kv_packed = model.attn_out;
-        gemm_bf16(handle, kv_packed, model.norm_out, lw.wkv, 1, 2 * kv_dim, MC::n_embd);
-        k_proj = kv_packed;
-        v_proj = kv_packed + kv_dim;
+        // Decode: packed Q+Gate+K+V in single GEMM (saves 1 cuBLAS call vs separate wq+wkv)
+        int qkv_dim = q_gate_dim + 2 * kv_dim;  // 10240
+        gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
+        k_proj = model.qkv_buf + q_gate_dim;
+        v_proj = model.qkv_buf + q_gate_dim + kv_dim;
     } else {
-        // Batched: separate GEMMs (avoids deinterleave overhead)
+        // Batched: separate GEMMs for Q and K/V
+        gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, n_tokens, q_gate_dim, MC::n_embd);
         k_proj = model.attn_out;
         gemm_bf16(handle, k_proj, model.norm_out, lw.wk, n_tokens, kv_dim, MC::n_embd);
         v_proj = model.ffn_buf2;
@@ -690,17 +689,15 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     }
     PE(norm_ms);
 
-    PS();
-    gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, 1, MC::n_head * MC::head_dim * 2, MC::n_embd);
-    PE(attn_gemm_ms);
-
     int kv_dim = MC::n_head_kv * MC::head_dim;
-    __nv_bfloat16* kv_packed = model.attn_out;
+    int q_gate_dim = MC::n_head * MC::head_dim * 2;
+    int qkv_dim = q_gate_dim + 2 * kv_dim;
+
     PS();
-    gemm_bf16(handle, kv_packed, model.norm_out, lw.wkv, 1, 2 * kv_dim, MC::n_embd);
+    gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
     PE(attn_gemm_ms);
-    __nv_bfloat16* k_proj = kv_packed;
-    __nv_bfloat16* v_proj = kv_packed + kv_dim;
+    __nv_bfloat16* k_proj = model.qkv_buf + q_gate_dim;
+    __nv_bfloat16* v_proj = model.qkv_buf + q_gate_dim + kv_dim;
 
     PS();
     __nv_bfloat16* q_contiguous = model.norm_out;
