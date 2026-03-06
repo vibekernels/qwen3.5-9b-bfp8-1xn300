@@ -1,6 +1,6 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 4 — SSM Shared Memory Decode
+## Status: Phase 5 — Kernel Fusion & Profiling
 
 Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on both prompt eval and generation.
 
@@ -9,7 +9,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (94 tok) | **1835 tok/s** | 563 tok/s | **3.26×** |
-| Generation | **91.7 tok/s** | 78.2 tok/s | **1.17×** |
+| Generation | **92.2 tok/s** | 77.8 tok/s | **1.19×** |
 
 ## Phase 2 Optimizations Applied
 
@@ -42,6 +42,12 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 
 ### SSM Decode Shared Memory (Phase 4)
 - **Single-token SSM step in shared memory**: 64KB state matrix (128x128) loaded into shared memory for decode, matching batched version pattern (43us -> 15us per call, 2.9x faster)
+
+### Cross-Layer Fusion & Profiling (Phase 5)
+- **Cross-layer residual fusion**: FFN down's bf16 residual add fused with next layer's input RMSNorm (saves 32 kernel launches per token)
+- **Fused conv1d+state update**: Combined conv1d_silu + update_conv_state into single kernel for decode (2→1 launch per SSM layer)
+- **Packed decode params**: Single 16-byte memcpy for token_id+position+kv_len (3→1 memcpy)
+- **Built-in profiling**: `PROFILE=1` env var for per-category GPU timing breakdown
 
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)

@@ -460,18 +460,24 @@ static void residual_add_f32(float* output, const float* a, const float* b, int 
 }
 
 static void forward_attention_layer_profiled(Model& model, int layer_idx, int attn_idx,
-    float* hidden, int* positions_d, cudaEvent_t t0, cudaEvent_t t1);
+    float* hidden, int* positions_d, __nv_bfloat16* pending_bf16, cudaEvent_t t0, cudaEvent_t t1);
 
 // Forward pass for one full-attention layer
 // hidden is f32 (residual stream). Internal computation uses bf16 for GEMMs.
+// pending_bf16: if non-null, fuse bf16→f32 residual add with input norm (saves 1 kernel launch)
 static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
-    float* hidden, int n_tokens, int* positions_d) {
+    float* hidden, int n_tokens, int* positions_d, __nv_bfloat16* pending_bf16 = nullptr) {
     auto& lw = model.attn_layers[attn_idx];
     auto handle = model.cublas_handle;
     cudaStream_t s = model.compute_stream;
 
-    // 1. RMSNorm (f32 in, bf16 out)
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    // 1. RMSNorm (f32 in, bf16 out) — optionally fused with pending residual
+    if (pending_bf16) {
+        launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, pending_bf16,
+            lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    } else {
+        launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    }
 
     // 2. Q+Gate projection: [n_tokens, 4096] -> [n_tokens, 8192]
     gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, n_tokens, MC::n_head * MC::head_dim * 2, MC::n_embd);
@@ -546,21 +552,30 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
-    // down_proj -> bf16, then fused bf16 residual add
+    // down_proj -> bf16
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
+    // Decode (n_tokens==1): residual add deferred — fused with next layer's norm
+    // Prompt (n_tokens>1): apply residual add here (no cross-layer fusion)
+    if (n_tokens > 1) {
+        launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
+    }
 }
 
 // Forward pass for one SSM (delta-net) layer
 // hidden is f32 (residual stream), n_tokens can be > 1 for prompt batching
 static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
-    float* hidden, int n_tokens) {
+    float* hidden, int n_tokens, __nv_bfloat16* pending_bf16 = nullptr) {
     auto& lw = model.ssm_layers[ssm_idx];
     auto handle = model.cublas_handle;
     cudaStream_t s = model.compute_stream;
 
-    // 1. RMSNorm (f32 in, bf16 out)
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    // 1. RMSNorm (f32 in, bf16 out) — optionally fused with pending residual
+    if (pending_bf16) {
+        launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, pending_bf16,
+            lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    } else {
+        launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
+    }
 
     // Pointers to SSM projection outputs
     float* qkv_proj;     // [n_tokens, ssm_conv_channels=8192]
@@ -644,16 +659,20 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
-    // down_proj -> bf16, then fused bf16 residual add
+    // down_proj -> bf16
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
+    // Decode: residual add deferred — fused with next layer's norm
+    // Prompt: apply residual add here
+    if (n_tokens > 1) {
+        launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
+    }
 }
 
 // Profiled attention layer (decode only, n_tokens=1)
 static void forward_attention_layer_profiled(Model& model, int layer_idx, int attn_idx,
-    float* hidden, int* positions_d, cudaEvent_t t0, cudaEvent_t t1) {
+    float* hidden, int* positions_d, __nv_bfloat16* pending_bf16, cudaEvent_t t0, cudaEvent_t t1) {
     if (!g_profile) {
-        forward_attention_layer(model, layer_idx, attn_idx, hidden, 1, positions_d);
+        forward_attention_layer(model, layer_idx, attn_idx, hidden, 1, positions_d, pending_bf16);
         return;
     }
     auto& lw = model.attn_layers[attn_idx];
@@ -663,7 +682,12 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
 #define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
 
     PS();
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    if (pending_bf16) {
+        launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, pending_bf16,
+            lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    } else {
+        launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    }
     PE(norm_ms);
 
     PS();
@@ -717,18 +741,16 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
     PE(ffn_down_ms);
 
-    PS();
-    launch_bf16_residual_add(hidden, model.attn_out, MC::n_embd, s);
-    PE(ffn_kernel_ms);
+    // bf16_residual_add deferred — fused with next layer's norm
 #undef PS
 #undef PE
 }
 
 // Profiled SSM layer (decode only, n_tokens=1)
 static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
-    float* hidden, cudaEvent_t t0, cudaEvent_t t1) {
+    float* hidden, __nv_bfloat16* pending_bf16, cudaEvent_t t0, cudaEvent_t t1) {
     if (!g_profile) {
-        forward_ssm_layer(model, layer_idx, ssm_idx, hidden, 1);
+        forward_ssm_layer(model, layer_idx, ssm_idx, hidden, 1, pending_bf16);
         return;
     }
     auto& lw = model.ssm_layers[ssm_idx];
@@ -738,7 +760,12 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
 #define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
 
     PS();
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    if (pending_bf16) {
+        launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, pending_bf16,
+            lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    } else {
+        launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    }
     PE(norm_ms);
 
     PS();
@@ -787,9 +814,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
     PE(ffn_down_ms);
 
-    PS();
-    launch_bf16_residual_add(hidden, model.attn_out, MC::n_embd, s);
-    PE(ffn_kernel_ms);
+    // bf16_residual_add deferred — fused with next layer's norm
 #undef PS
 #undef PE
 }
@@ -839,19 +864,22 @@ static void forward_decode_body(Model& model) {
         model.hidden_state, model.tok_embd, g_token_d, MC::n_embd);
     PROF_END(embedding_ms);
 
-    // Process all layers
+    // Process all layers — each layer defers its final bf16 residual add,
+    // which gets fused with the next layer's input norm
+    __nv_bfloat16* pending_bf16 = nullptr;
     for (int il = 0; il < MC::n_layers; il++) {
         if (MC::is_recurrent(il)) {
-            forward_ssm_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, t0, t1);
+            forward_ssm_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, pending_bf16, t0, t1);
         } else {
-            forward_attention_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, g_pos_d, t0, t1);
+            forward_attention_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, g_pos_d, pending_bf16, t0, t1);
         }
+        pending_bf16 = model.attn_out;  // FFN down output, to be fused with next layer's norm
     }
 
-    // Final norm: f32 in, bf16 out
+    // Final norm: fuse last layer's residual add with output norm
     PROF_START();
-    launch_rmsnorm_f32in(model.norm_out, model.hidden_state, model.output_norm,
-        1, MC::n_embd, MC::rms_norm_eps, s);
+    launch_fused_bf16_residual_rmsnorm(model.norm_out, model.hidden_state, pending_bf16,
+        model.output_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
     PROF_END(norm_ms);
 
     // LM head: [1, 4096] -> [1, 248320] -> f32 logits
