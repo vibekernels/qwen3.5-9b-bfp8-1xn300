@@ -87,6 +87,90 @@ int gpu_argmax_on_stream(float* logits_device, int vocab_size, cudaStream_t stre
     return result;
 }
 
+// GPU candidate reduction: 1024 threads each find their local best (val, idx).
+// Outputs 1024 candidates to global memory for CPU-side top-k + sampling.
+// Much less data than full logits (8KB vs 1MB).
+__global__ void reduce_candidates_kernel(
+    float* __restrict__ out_vals,
+    int* __restrict__ out_idxs,
+    const float* __restrict__ logits,
+    int n,
+    float inv_temp
+) {
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    float best_val = -1e30f;
+    int best_idx = 0;
+    for (int i = tid; i < n; i += stride) {
+        float v = logits[i] * inv_temp;
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+
+    out_vals[tid] = best_val;
+    out_idxs[tid] = best_idx;
+}
+
+static const int N_CANDIDATES = 1024;
+static float* g_cand_vals = nullptr;
+static int* g_cand_idxs = nullptr;
+
+int gpu_sample_on_stream(float* logits_device, int vocab_size, float temperature,
+                         cudaStream_t stream, int top_k, float top_p) {
+    if (top_k <= 0) top_k = 40;
+
+    if (!g_cand_vals) {
+        g_cand_vals = cuda_alloc<float>(N_CANDIDATES);
+        g_cand_idxs = cuda_alloc<int>(N_CANDIDATES);
+    }
+
+    float inv_temp = 1.0f / temperature;
+    reduce_candidates_kernel<<<1, N_CANDIDATES, 0, stream>>>(
+        g_cand_vals, g_cand_idxs, logits_device, vocab_size, inv_temp);
+
+    // Download 1024 candidates (8KB instead of 1MB)
+    float h_vals[N_CANDIDATES];
+    int h_idxs[N_CANDIDATES];
+    cudaMemcpyAsync(h_vals, g_cand_vals, N_CANDIDATES * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_idxs, g_cand_idxs, N_CANDIDATES * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // Sort candidates by value (descending) and take top-k
+    std::vector<int> order(N_CANDIDATES);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+        [&](int a, int b) { return h_vals[a] > h_vals[b]; });
+
+    // Softmax over top-k
+    float max_val = h_vals[order[0]];
+    std::vector<float> probs(top_k);
+    float sum = 0.0f;
+    for (int i = 0; i < top_k; i++) {
+        probs[i] = expf(h_vals[order[i]] - max_val);
+        sum += probs[i];
+    }
+    for (int i = 0; i < top_k; i++) probs[i] /= sum;
+
+    // Top-p filtering (already sorted descending)
+    if (top_p < 1.0f) {
+        float cumsum = 0.0f;
+        int cutoff = top_k;
+        for (int i = 0; i < top_k; i++) {
+            cumsum += probs[i];
+            if (cumsum >= top_p) { cutoff = i + 1; break; }
+        }
+        sum = 0.0f;
+        for (int i = 0; i < cutoff; i++) sum += probs[i];
+        for (int i = 0; i < cutoff; i++) probs[i] /= sum;
+        for (int i = cutoff; i < top_k; i++) probs[i] = 0.0f;
+    }
+
+    // Sample
+    static std::mt19937 rng(42);
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return h_idxs[order[dist(rng)]];
+}
+
 // Simple CPU-side sampling (good enough for single-token generation)
 int sample_token(float* logits_device, int vocab_size, float temperature, int top_k, float top_p) {
     // Greedy (argmax) for temperature <= 0 — done on GPU

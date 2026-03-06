@@ -924,7 +924,8 @@ static int forward_decode(Model& model, int token_id, int position) {
     int decode_params[4] = { token_id, position, model.kv_len, model.kv_len + 1 };
     CUDA_CHECK(cudaMemcpyAsync(g_decode_params_d, decode_params, 4 * sizeof(int), cudaMemcpyHostToDevice, s));
 
-    if (getenv("NO_GRAPH") || g_profile) {
+    static bool no_graph = (getenv("NO_GRAPH") != nullptr);
+    if (no_graph || g_profile) {
         forward_decode_body(model);
     } else if (!model.decode_graph_captured) {
         // First decode: capture the compute graph
@@ -941,12 +942,11 @@ static int forward_decode(Model& model, int token_id, int position) {
 
     model.kv_len += 1;
 
-    // Sample: for greedy, launch argmax on compute_stream (avoids sync gap)
+    // Sample on compute stream (avoids full logits download)
     if (g_temperature <= 0.0f) {
         return gpu_argmax_on_stream(model.logits_f32, MC::n_vocab, s);
     }
-    CUDA_CHECK(cudaStreamSynchronize(s));
-    return sample_token(model.logits_f32, MC::n_vocab, g_temperature);
+    return gpu_sample_on_stream(model.logits_f32, MC::n_vocab, g_temperature, s);
 }
 
 // ============================================================================
@@ -1138,13 +1138,15 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
             break;
         }
 
-        std::string tok_str = g_tokenizer.decode(next_token);
         generated++;
         g_cached_tokens.push_back(next_token);
 
-        if (cb && !cb(next_token, tok_str)) {
-            reason = STOP_CALLBACK;
-            break;
+        if (cb) {
+            std::string tok_str = g_tokenizer.decode(next_token);
+            if (!cb(next_token, tok_str)) {
+                reason = STOP_CALLBACK;
+                break;
+            }
         }
 
         int pos = g_model.kv_len;
