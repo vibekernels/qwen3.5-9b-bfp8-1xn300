@@ -191,6 +191,55 @@ void launch_update_conv_state(
         new_state, input, old_state, n_tokens, channels, conv_kernel_size);
 }
 
+// Fused conv1d+SiLU+state update for decode (n_tokens=1)
+// conv_state: [(conv_kernel-1), channels] — updated in-place
+// Performs conv1d with SiLU, then shifts state window
+__global__ void conv1d_silu_update_kernel(
+    float* __restrict__ output,           // [channels]
+    float* __restrict__ conv_state,       // [(conv_kernel-1) * channels]
+    const float* __restrict__ input,      // [channels]
+    const float* __restrict__ conv_weight, // [channels, conv_kernel]  (row per channel, conv_kernel cols)
+    int channels,
+    int conv_kernel_size
+) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels) return;
+
+    int state_len = conv_kernel_size - 1; // 3 for conv_kernel=4
+
+    // Compute conv1d: sum over kernel positions
+    float sum = 0.0f;
+    // Positions 0..state_len-1 come from conv_state, position state_len from input
+    for (int k = 0; k < state_len; k++) {
+        sum += conv_state[(int64_t)k * channels + ch] * conv_weight[(int64_t)ch * conv_kernel_size + k];
+    }
+    sum += input[ch] * conv_weight[(int64_t)ch * conv_kernel_size + state_len];
+
+    // SiLU
+    output[ch] = sum / (1.0f + expf(-sum));
+
+    // Update state: shift left by 1, add new input at end
+    for (int i = 0; i < state_len - 1; i++) {
+        conv_state[(int64_t)i * channels + ch] = conv_state[(int64_t)(i + 1) * channels + ch];
+    }
+    conv_state[(int64_t)(state_len - 1) * channels + ch] = input[ch];
+}
+
+void launch_conv1d_silu_update(
+    float* output,
+    float* conv_state,
+    const float* input,
+    const float* conv_weight,
+    int channels,
+    int conv_kernel_size,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = cdiv(channels, threads);
+    conv1d_silu_update_kernel<<<blocks, threads, 0, stream>>>(
+        output, conv_state, input, conv_weight, channels, conv_kernel_size);
+}
+
 // L2 normalization per vector
 // input: [n, dim], normalize each row (f32 in/out)
 __global__ void l2_norm_kernel(

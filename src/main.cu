@@ -51,6 +51,8 @@ void launch_conv1d_silu(float* output, const float* input,
     int n_tokens, int channels, int conv_kernel_size, cudaStream_t stream);
 void launch_update_conv_state(float* new_state, const float* input,
     const float* old_state, int n_tokens, int channels, int conv_kernel_size, cudaStream_t stream);
+void launch_conv1d_silu_update(float* output, float* conv_state, const float* input,
+    const float* conv_weight, int channels, int conv_kernel_size, cudaStream_t stream);
 void launch_l2_norm(float* output, const float* input,
     int n_vectors, int dim, float eps, cudaStream_t stream);
 void launch_delta_net_decode(float* output, float* state,
@@ -158,6 +160,25 @@ static bool g_use_custom_gemv = false;
 static int* g_decode_params_d = nullptr;
 static int* g_token_d = nullptr;   // points to g_decode_params_d[0]
 static int* g_pos_d = nullptr;     // points to g_decode_params_d[1]
+
+// Profiling support
+static bool g_profile = false;
+static int g_profile_tokens = 0;
+struct ProfileTimers {
+    double embedding_ms = 0, attn_gemm_ms = 0, attn_kernel_ms = 0;
+    double ssm_gemm_ms = 0, ssm_conv_ms = 0, ssm_step_ms = 0;
+    double ffn_gate_up_ms = 0, ffn_down_ms = 0, ffn_kernel_ms = 0;
+    double lm_head_ms = 0, norm_ms = 0;
+};
+static ProfileTimers g_prof;
+
+static double sync_and_ms(cudaStream_t s, cudaEvent_t start, cudaEvent_t stop) {
+    cudaEventRecord(stop, s);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    return (double)ms;
+}
 
 // cuBLAS GEMM wrapper: C = A @ B^T  (row-major), bf16 output
 // A: [M, K] bf16, B: [N, K] bf16, C: [M, N] bf16
@@ -420,6 +441,7 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     cublasSetStream(model.cublas_handle, model.compute_stream);
     g_compute_stream = model.compute_stream;
     g_use_custom_gemv = (getenv("CUSTOM_GEMV") != nullptr);
+    g_profile = (getenv("PROFILE") != nullptr);
     model.decode_graph = nullptr;
     model.decode_graph_exec = nullptr;
     model.decode_graph_captured = false;
@@ -436,6 +458,9 @@ __global__ void residual_add_f32_kernel(float* output, const float* a, const flo
 static void residual_add_f32(float* output, const float* a, const float* b, int n, cudaStream_t stream = 0) {
     residual_add_f32_kernel<<<cdiv(n, 256), 256, 0, stream>>>(output, a, b, n);
 }
+
+static void forward_attention_layer_profiled(Model& model, int layer_idx, int attn_idx,
+    float* hidden, int* positions_d, cudaEvent_t t0, cudaEvent_t t1);
 
 // Forward pass for one full-attention layer
 // hidden is f32 (residual stream). Internal computation uses bf16 for GEMMs.
@@ -570,13 +595,17 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
             combined_bf16, n_tokens, MC::ssm_conv_channels, MC::ssm_d_inner, MC::ssm_dt_rank, combined_n);
     }
 
-    // 6. Conv1d + SiLU on QKV mixed (f32 in, f32 out, batched)
-    launch_conv1d_silu(model.ssm_conv_out_buf, qkv_proj, model.ssm_conv_state[ssm_idx],
-        lw.ssm_conv1d, n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
-
-    // Update conv state (f32 input)
-    launch_update_conv_state(model.ssm_conv_state[ssm_idx], qkv_proj,
-        model.ssm_conv_state[ssm_idx], n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+    // 6. Conv1d + SiLU on QKV mixed (f32 in, f32 out)
+    if (n_tokens == 1) {
+        // Decode: fused conv1d+SiLU+state update (1 kernel instead of 2)
+        launch_conv1d_silu_update(model.ssm_conv_out_buf, model.ssm_conv_state[ssm_idx],
+            qkv_proj, lw.ssm_conv1d, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+    } else {
+        launch_conv1d_silu(model.ssm_conv_out_buf, qkv_proj, model.ssm_conv_state[ssm_idx],
+            lw.ssm_conv1d, n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+        launch_update_conv_state(model.ssm_conv_state[ssm_idx], qkv_proj,
+            model.ssm_conv_state[ssm_idx], n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+    }
 
     // 7-13. Fused SSM step
     float scale = 1.0f / sqrtf((float)MC::ssm_d_state);
@@ -620,6 +649,151 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
 }
 
+// Profiled attention layer (decode only, n_tokens=1)
+static void forward_attention_layer_profiled(Model& model, int layer_idx, int attn_idx,
+    float* hidden, int* positions_d, cudaEvent_t t0, cudaEvent_t t1) {
+    if (!g_profile) {
+        forward_attention_layer(model, layer_idx, attn_idx, hidden, 1, positions_d);
+        return;
+    }
+    auto& lw = model.attn_layers[attn_idx];
+    auto handle = model.cublas_handle;
+    cudaStream_t s = model.compute_stream;
+#define PS() cudaEventRecord(t0, s)
+#define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
+
+    PS();
+    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    PE(norm_ms);
+
+    PS();
+    gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, 1, MC::n_head * MC::head_dim * 2, MC::n_embd);
+    PE(attn_gemm_ms);
+
+    int kv_dim = MC::n_head_kv * MC::head_dim;
+    __nv_bfloat16* kv_packed = model.attn_out;
+    PS();
+    gemm_bf16(handle, kv_packed, model.norm_out, lw.wkv, 1, 2 * kv_dim, MC::n_embd);
+    PE(attn_gemm_ms);
+    __nv_bfloat16* k_proj = kv_packed;
+    __nv_bfloat16* v_proj = kv_packed + kv_dim;
+
+    PS();
+    __nv_bfloat16* q_contiguous = model.norm_out;
+    __nv_bfloat16* gate_buf = model.hidden_bf16;
+    int total = MC::n_head * MC::head_dim;
+    deinterleave_qg_kernel<<<cdiv(total, 256), 256, 0, s>>>(
+        q_contiguous, gate_buf, model.qkv_buf, MC::n_head, MC::head_dim);
+    launch_rmsnorm_head(q_contiguous, q_contiguous, lw.attn_q_norm, 1, MC::n_head, MC::head_dim, MC::rms_norm_eps, s);
+    launch_rmsnorm_head(k_proj, k_proj, lw.attn_k_norm, 1, MC::n_head_kv, MC::head_dim, MC::rms_norm_eps, s);
+    launch_rope(q_contiguous, positions_d, 1, MC::n_head, MC::head_dim, MC::rope_dim, MC::rope_freq_base, s);
+    launch_rope(k_proj, positions_d, 1, MC::n_head_kv, MC::head_dim, MC::rope_dim, MC::rope_freq_base, s);
+    launch_kv_cache_append(model.k_cache[attn_idx], k_proj, model.d_kv_len, 1, kv_dim, s);
+    launch_kv_cache_append(model.v_cache[attn_idx], v_proj, model.d_kv_len, 1, kv_dim, s);
+    launch_attention_decode(model.attn_out, q_contiguous,
+        model.k_cache[attn_idx], model.v_cache[attn_idx],
+        model.d_kv_len + 1, model.max_kv_len, MC::n_head, MC::n_head_kv, MC::head_dim, MC::attn_scale, s);
+    launch_sigmoid_mul(model.attn_out, model.attn_out, gate_buf, MC::n_head * MC::head_dim, s);
+    PE(attn_kernel_ms);
+
+    PS();
+    gemm_bf16(handle, model.attn_out, model.attn_out, lw.wo, 1, MC::n_embd, MC::n_head * MC::head_dim);
+    PE(attn_gemm_ms);
+
+    PS();
+    launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
+        lw.post_attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    PE(norm_ms);
+
+    PS();
+    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+    PE(ffn_gate_up_ms);
+
+    PS();
+    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, 1, MC::n_ff, s);
+    PE(ffn_kernel_ms);
+
+    PS();
+    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
+    PE(ffn_down_ms);
+
+    PS();
+    launch_bf16_residual_add(hidden, model.attn_out, MC::n_embd, s);
+    PE(ffn_kernel_ms);
+#undef PS
+#undef PE
+}
+
+// Profiled SSM layer (decode only, n_tokens=1)
+static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
+    float* hidden, cudaEvent_t t0, cudaEvent_t t1) {
+    if (!g_profile) {
+        forward_ssm_layer(model, layer_idx, ssm_idx, hidden, 1);
+        return;
+    }
+    auto& lw = model.ssm_layers[ssm_idx];
+    auto handle = model.cublas_handle;
+    cudaStream_t s = model.compute_stream;
+#define PS() cudaEventRecord(t0, s)
+#define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
+
+    PS();
+    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    PE(norm_ms);
+
+    PS();
+    static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
+    gemm_bf16_f32out(handle, model.gemm_out, model.norm_out, lw.w_combined, 1, combined_n, MC::n_embd);
+    PE(ssm_gemm_ms);
+
+    float* qkv_proj = model.gemm_out;
+    float* z_buf = model.gemm_out + MC::ssm_conv_channels;
+    float* alpha_f32 = model.gemm_out + MC::ssm_conv_channels + MC::ssm_d_inner;
+    float* beta_raw_f32 = model.gemm_out + MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank;
+
+    PS();
+    launch_conv1d_silu_update(model.ssm_conv_out_buf, model.ssm_conv_state[ssm_idx],
+        qkv_proj, lw.ssm_conv1d, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+    PE(ssm_conv_ms);
+
+    PS();
+    float scale = 1.0f / sqrtf((float)MC::ssm_d_state);
+    launch_fused_ssm_step(
+        model.norm_out, model.ssm_recurrent_state[ssm_idx], model.ssm_conv_out_buf,
+        alpha_f32, lw.ssm_dt_bias, lw.ssm_a, beta_raw_f32,
+        z_buf, lw.ssm_norm,
+        MC::ssm_n_group, MC::ssm_dt_rank, MC::ssm_d_state, MC::ssm_head_v_dim,
+        scale, MC::rms_norm_eps, MC::rms_norm_eps, s);
+    PE(ssm_step_ms);
+
+    PS();
+    gemm_bf16(handle, model.attn_out, model.norm_out, lw.ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
+    PE(ssm_gemm_ms);
+
+    PS();
+    launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
+        lw.post_attn_norm, 1, MC::n_embd, MC::rms_norm_eps, s);
+    PE(norm_ms);
+
+    PS();
+    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+    PE(ffn_gate_up_ms);
+
+    PS();
+    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, 1, MC::n_ff, s);
+    PE(ffn_kernel_ms);
+
+    PS();
+    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
+    PE(ffn_down_ms);
+
+    PS();
+    launch_bf16_residual_add(hidden, model.attn_out, MC::n_embd, s);
+    PE(ffn_kernel_ms);
+#undef PS
+#undef PE
+}
+
 // Global temperature (set from command line)
 static float g_temperature = 0.8f;
 
@@ -650,26 +824,49 @@ static void ensure_decode_bufs() {
 static void forward_decode_body(Model& model) {
     cudaStream_t s = model.compute_stream;
 
+    cudaEvent_t t0, t1;
+    if (g_profile) {
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+    }
+
+#define PROF_START() if (g_profile) cudaEventRecord(t0, s)
+#define PROF_END(field) if (g_profile) g_prof.field += sync_and_ms(s, t0, t1)
+
     // Embedding lookup -> f32 hidden state
+    PROF_START();
     embedding_to_f32_kernel<<<1, 1024, 0, s>>>(
         model.hidden_state, model.tok_embd, g_token_d, MC::n_embd);
+    PROF_END(embedding_ms);
 
     // Process all layers
     for (int il = 0; il < MC::n_layers; il++) {
         if (MC::is_recurrent(il)) {
-            forward_ssm_layer(model, il, model.layer_subidx[il], model.hidden_state, 1);
+            forward_ssm_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, t0, t1);
         } else {
-            forward_attention_layer(model, il, model.layer_subidx[il], model.hidden_state, 1, g_pos_d);
+            forward_attention_layer_profiled(model, il, model.layer_subidx[il], model.hidden_state, g_pos_d, t0, t1);
         }
     }
 
     // Final norm: f32 in, bf16 out
+    PROF_START();
     launch_rmsnorm_f32in(model.norm_out, model.hidden_state, model.output_norm,
         1, MC::n_embd, MC::rms_norm_eps, s);
+    PROF_END(norm_ms);
 
     // LM head: [1, 4096] -> [1, 248320] -> f32 logits
+    PROF_START();
     gemm_bf16_f32out(model.cublas_handle, model.logits_f32, model.norm_out, model.output,
         1, MC::n_vocab, MC::n_embd);
+    PROF_END(lm_head_ms);
+
+    if (g_profile) {
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+        g_profile_tokens++;
+    }
+#undef PROF_START
+#undef PROF_END
 }
 
 // Full forward pass for n_tokens=1 (decode step) with CUDA graph acceleration
@@ -681,7 +878,7 @@ static int forward_decode(Model& model, int token_id, int position) {
     int decode_params[4] = { token_id, position, model.kv_len, model.kv_len + 1 };
     CUDA_CHECK(cudaMemcpyAsync(g_decode_params_d, decode_params, 4 * sizeof(int), cudaMemcpyHostToDevice, s));
 
-    if (getenv("NO_GRAPH")) {
+    if (getenv("NO_GRAPH") || g_profile) {
         forward_decode_body(model);
     } else if (!model.decode_graph_captured) {
         // First decode: capture the compute graph
@@ -872,6 +1069,38 @@ int main(int argc, char** argv) {
     printf("Generated tokens: %zu (%.1f ms, %.1f tok/s)\n",
         generated.size(), gen_ms,
         generated.size() * 1000.0 / gen_ms);
+
+    if (g_profile && g_profile_tokens > 0) {
+        int n = g_profile_tokens;
+        double ffn_gemm = g_prof.ffn_gate_up_ms + g_prof.ffn_down_ms;
+        double total = g_prof.attn_gemm_ms + g_prof.attn_kernel_ms + g_prof.ssm_gemm_ms +
+            g_prof.ssm_conv_ms + g_prof.ssm_step_ms + ffn_gemm + g_prof.ffn_kernel_ms +
+            g_prof.lm_head_ms + g_prof.norm_ms + g_prof.embedding_ms;
+        double gemm_total = g_prof.attn_gemm_ms + g_prof.ssm_gemm_ms + ffn_gemm + g_prof.lm_head_ms;
+        printf("\n--- Profile (%d tokens, %.1f ms total, %.1f ms/tok) ---\n", n, total, total / n);
+        printf("  FFN gate+up:  %7.1f ms (%5.1f%%, %.2f ms/tok)  [32×, N=24576 K=4096]\n", g_prof.ffn_gate_up_ms, 100*g_prof.ffn_gate_up_ms/total, g_prof.ffn_gate_up_ms/n);
+        printf("  FFN down:     %7.1f ms (%5.1f%%, %.2f ms/tok)  [32×, N=4096 K=12288]\n", g_prof.ffn_down_ms, 100*g_prof.ffn_down_ms/total, g_prof.ffn_down_ms/n);
+        printf("  SSM GEMM:     %7.1f ms (%5.1f%%, %.2f ms/tok)  [24× combined+out]\n", g_prof.ssm_gemm_ms, 100*g_prof.ssm_gemm_ms/total, g_prof.ssm_gemm_ms/n);
+        printf("  LM head:      %7.1f ms (%5.1f%%, %.2f ms/tok)  [1×, N=248320 K=4096]\n", g_prof.lm_head_ms, 100*g_prof.lm_head_ms/total, g_prof.lm_head_ms/n);
+        printf("  Attn GEMM:    %7.1f ms (%5.1f%%, %.2f ms/tok)  [8× wq+wkv+wo]\n", g_prof.attn_gemm_ms, 100*g_prof.attn_gemm_ms/total, g_prof.attn_gemm_ms/n);
+        printf("  SSM conv:     %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ssm_conv_ms, 100*g_prof.ssm_conv_ms/total, g_prof.ssm_conv_ms/n);
+        printf("  SSM step:     %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ssm_step_ms, 100*g_prof.ssm_step_ms/total, g_prof.ssm_step_ms/n);
+        printf("  Norms:        %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.norm_ms, 100*g_prof.norm_ms/total, g_prof.norm_ms/n);
+        printf("  Attn kernels: %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.attn_kernel_ms, 100*g_prof.attn_kernel_ms/total, g_prof.attn_kernel_ms/n);
+        printf("  FFN kernels:  %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.ffn_kernel_ms, 100*g_prof.ffn_kernel_ms/total, g_prof.ffn_kernel_ms/n);
+        printf("  Embedding:    %7.1f ms (%5.1f%%, %.2f ms/tok)\n", g_prof.embedding_ms, 100*g_prof.embedding_ms/total, g_prof.embedding_ms/n);
+        printf("  ---\n");
+        printf("  GEMM total:   %7.1f ms (%5.1f%%, %.2f ms/tok)\n", gemm_total, 100*gemm_total/total, gemm_total/n);
+        // Bandwidth calculation
+        double weight_bytes = (
+            32.0 * (24576 + 4096) * 4096 +  // FFN gate_up + down (all layers)
+            24.0 * (12352 + 4096) * 4096 +  // SSM combined + out
+            8.0 * (8192 + 2048 + 4096) * 4096 +  // Attn wq + wkv + wo
+            248320.0 * 4096  // LM head
+        ) * 2;  // bf16 = 2 bytes
+        printf("  Weight bytes:  %.1f MB/tok, BW util: %.0f%% of 1792 GB/s\n",
+            weight_bytes / 1e6, 100.0 * weight_bytes / (gemm_total / n / 1000.0) / 1.792e12);
+    }
 
     free_model(model);
     return 0;
