@@ -967,7 +967,7 @@ int main(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        model_path = "/home/ubuntu/.cache/llama.cpp/unsloth_Qwen3.5-9B-GGUF_Qwen3.5-9B-BF16.gguf";
+        model_path = "/workspace/models/Qwen3.5-9B-BF16.gguf";
     }
     if (prompt.empty()) {
         prompt = "Hello, world!";
