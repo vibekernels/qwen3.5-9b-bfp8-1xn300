@@ -432,7 +432,8 @@ void launch_gated_rmsnorm(
 
 // Fused SSM step: l2_norm + repeat + delta_net_decode + gated_rmsnorm
 // One block per v_head (32 blocks). Does everything for one token.
-__global__ void fused_ssm_step_kernel(
+__global__ void __launch_bounds__(128, 1)
+fused_ssm_step_kernel(
     __nv_bfloat16* __restrict__ output,      // [ssm_d_inner] bf16 output
     float* __restrict__ state,               // [num_v_heads, head_dim, head_dim] IN/OUT
     const float* __restrict__ conv_out,      // [conv_channels] (q+k+v concatenated)
@@ -462,11 +463,23 @@ __global__ void fused_ssm_step_kernel(
     const float* k_raw = conv_out + qk_size + k_head * head_k_dim;
     const float* v_ptr = conv_out + 2 * qk_size + v_head * head_v_dim;
 
-    // Shared memory for q, k, v, and temporaries
+    // Shared memory layout: state (64KB) + q + k + v vectors
     extern __shared__ float smem[];
-    float* s_q = smem;                    // [head_k_dim]
-    float* s_k = s_q + head_k_dim;       // [head_k_dim]
-    float* s_v = s_k + head_k_dim;       // [head_v_dim]
+    float* s_state = smem;                                     // [head_k_dim * head_v_dim] = 64KB
+    float* s_q = s_state + head_k_dim * head_v_dim;           // [head_k_dim]
+    float* s_k = s_q + head_k_dim;                            // [head_k_dim]
+    float* s_v = s_k + head_k_dim;                            // [head_v_dim]
+
+    __shared__ float sq_shared[32], sk_shared[32];
+    __shared__ float s_q_inv, s_k_inv, s_rms;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // Load state from global to shared memory
+    float* g_state = state + (int64_t)v_head * head_v_dim * head_v_dim;
+    for (int i = tid; i < head_k_dim * head_v_dim; i += stride) {
+        s_state[i] = g_state[i];
+    }
 
     // Load Q and K, compute L2 norms
     float q_sq = 0.0f, k_sq = 0.0f;
@@ -484,9 +497,6 @@ __global__ void fused_ssm_step_kernel(
         q_sq += __shfl_down_sync(0xffffffff, q_sq, offset);
         k_sq += __shfl_down_sync(0xffffffff, k_sq, offset);
     }
-    __shared__ float sq_shared[32], sk_shared[32];
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
     if (lane_id == 0) { sq_shared[warp_id] = q_sq; sk_shared[warp_id] = k_sq; }
     __syncthreads();
     if (warp_id == 0) {
@@ -497,7 +507,6 @@ __global__ void fused_ssm_step_kernel(
             k_sq += __shfl_down_sync(0xffffffff, k_sq, offset);
         }
     }
-    __shared__ float s_q_inv, s_k_inv;
     if (tid == 0) {
         s_q_inv = rsqrtf(fmaxf(q_sq, l2_eps * l2_eps));
         s_k_inv = rsqrtf(fmaxf(k_sq, l2_eps * l2_eps));
@@ -517,7 +526,6 @@ __global__ void fused_ssm_step_kernel(
     __syncthreads();
 
     // Compute gate and beta inline (saves 2 kernel launches)
-    float* s = state + (int64_t)v_head * head_v_dim * head_v_dim;
     float alpha_val = alpha[v_head];
     float biased = alpha_val + dt_bias[v_head];
     // softplus
@@ -526,29 +534,34 @@ __global__ void fused_ssm_step_kernel(
     float g = expf(gate_val);
     float b = 1.0f / (1.0f + expf(-beta_raw[v_head]));
 
-    // Decay state
+    // Decay state (in shared memory!)
     for (int i = tid; i < head_v_dim * head_v_dim; i += stride) {
-        s[i] *= g;
+        s_state[i] *= g;
     }
     __syncthreads();
 
-    // Per-column: sk, delta update, query
+    // Per-column: sk, delta update, query (all in shared memory)
     for (int i = tid; i < head_v_dim; i += stride) {
         float sk = 0.0f;
         for (int j = 0; j < head_k_dim; j++) {
-            sk += s[j * head_v_dim + i] * s_k[j];
+            sk += s_state[j * head_v_dim + i] * s_k[j];
         }
         float d = b * (s_v[i] - sk);
         for (int j = 0; j < head_k_dim; j++) {
-            s[j * head_v_dim + i] += s_k[j] * d;
+            s_state[j * head_v_dim + i] += s_k[j] * d;
         }
         float out = 0.0f;
         for (int j = 0; j < head_k_dim; j++) {
-            out += s[j * head_v_dim + i] * s_q[j];
+            out += s_state[j * head_v_dim + i] * s_q[j];
         }
         s_v[i] = out;  // reuse s_v for delta output
     }
     __syncthreads();
+
+    // Write state back to global memory
+    for (int i = tid; i < head_k_dim * head_v_dim; i += stride) {
+        g_state[i] = s_state[i];
+    }
 
     // Gated RMSNorm: rmsnorm(delta_out) * silu(z)
     float sum_sq = 0.0f;
@@ -567,7 +580,6 @@ __global__ void fused_ssm_step_kernel(
             sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
         }
     }
-    __shared__ float s_rms;
     if (tid == 0) {
         s_rms = rsqrtf(sum_sq / head_v_dim + rms_eps);
     }
@@ -604,7 +616,17 @@ void launch_fused_ssm_step(
     cudaStream_t stream
 ) {
     int threads = 128;
-    size_t smem = (head_k_dim + head_k_dim + head_v_dim) * sizeof(float);
+    // State (128*128) + q (128) + k (128) + v (128) = 16768 floats = 67KB
+    size_t smem = (head_k_dim * head_v_dim + head_k_dim + head_k_dim + head_v_dim) * sizeof(float);
+
+    // Request extended shared memory (>48KB requires explicit opt-in)
+    static bool smem_configured = false;
+    if (!smem_configured) {
+        cudaFuncSetAttribute(fused_ssm_step_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        smem_configured = true;
+    }
+
     fused_ssm_step_kernel<<<num_v_heads, threads, smem, stream>>>(
         output, state, conv_out, alpha, dt_bias, ssm_a, beta_raw, z, norm_weight,
         num_k_heads, num_v_heads, head_k_dim, head_v_dim, scale, l2_eps, rms_eps);

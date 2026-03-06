@@ -696,7 +696,9 @@ static int forward_decode(Model& model, int token_id, int position) {
     CUDA_CHECK(cudaMemcpyAsync(g_pos_d, &position, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(model.d_kv_len, kv_params, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
 
-    if (!model.decode_graph_captured) {
+    if (getenv("NO_GRAPH")) {
+        forward_decode_body(model);
+    } else if (!model.decode_graph_captured) {
         // First decode: capture the compute graph
         CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
         forward_decode_body(model);

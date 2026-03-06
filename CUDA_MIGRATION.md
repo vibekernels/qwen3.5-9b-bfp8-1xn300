@@ -1,6 +1,6 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 3 Complete (CUDA Graphs — Further optimized)
+## Status: Phase 4 — SSM Shared Memory Decode
 
 Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on both prompt eval and generation.
 
@@ -9,7 +9,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (94 tok) | **1835 tok/s** | 563 tok/s | **3.26×** |
-| Generation | **86.4 tok/s** | 78.2 tok/s | **1.10×** |
+| Generation | **91.7 tok/s** | 78.2 tok/s | **1.17×** |
 
 ## Phase 2 Optimizations Applied
 
@@ -39,6 +39,9 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 - **Device-side kv_len**: Attention kernels read kv_len from device memory so graph stays valid as kv_len changes
 - **Named compute stream**: All operations routed through a non-default stream for graph capture compatibility
 - **Stream-aware argmax**: Greedy sampling runs on compute stream, avoiding sync gap between graph and sampling
+
+### SSM Decode Shared Memory (Phase 4)
+- **Single-token SSM step in shared memory**: 64KB state matrix (128x128) loaded into shared memory for decode, matching batched version pattern (43us -> 15us per call, 2.9x faster)
 
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)
