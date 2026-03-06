@@ -98,10 +98,10 @@ void launch_kv_cache_append(
 // V_cache: [kv_len, n_head_kv, head_dim]
 // Output: [n_tokens, n_head, head_dim]
 
-// Compute attention scores for one query head against one KV head
-// score[i] = Q[q_token, head] . K[i, kv_head] / scale
-// Then softmax, then weighted sum of V
-// kv_len read from device pointer (for CUDA graph compatibility)
+// Online softmax attention decode: processes KV in tiles without materializing
+// all scores in shared memory. Uses FlashAttention-style online softmax to
+// support arbitrarily long contexts within fixed shared memory.
+// Each block handles one Q head, each thread accumulates over head_dim elements.
 __global__ void attention_decode_kernel(
     __nv_bfloat16* __restrict__ output,    // [n_head, head_dim]
     const __nv_bfloat16* __restrict__ q,   // [n_head, head_dim]
@@ -114,93 +114,73 @@ __global__ void attention_decode_kernel(
     float scale
 ) {
     int kv_len = *d_kv_len;
-    // Each block handles one Q head
     const int head = blockIdx.x;
-    const int kv_head = head / (n_head / n_head_kv); // GQA mapping
+    const int kv_head = head / (n_head / n_head_kv);
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
 
-    extern __shared__ float smem[];
-    float* scores = smem;  // [kv_len]
-
     const __nv_bfloat16* q_head = q + head * head_dim;
 
-    // Compute Q . K^T for all KV positions
-    for (int kv_pos = tid; kv_pos < kv_len; kv_pos += stride) {
+    // Each thread maintains online softmax state for its V dimensions
+    // Thread tid handles dimensions: tid, tid+stride, tid+2*stride, ...
+    float thread_max = -FLT_MAX;
+    float thread_sum = 0.0f;
+
+    // Per-thread V accumulator (in registers, up to 256/stride dims per thread)
+    // head_dim=256, stride=256 → 1 dim per thread
+    float acc[4] = {0, 0, 0, 0};  // supports head_dim up to 4*stride=1024
+    int n_dims = 0;
+    for (int d = tid; d < head_dim; d += stride) n_dims++;
+
+    // Process all KV positions with online softmax
+    for (int kv_pos = 0; kv_pos < kv_len; kv_pos++) {
+        // Compute Q . K for this position (all threads collaborate)
         const __nv_bfloat16* k_vec = k_cache + (int64_t)kv_pos * n_head_kv * head_dim + kv_head * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
+        for (int d = tid; d < head_dim; d += stride) {
             dot += __bfloat162float(q_head[d]) * __bfloat162float(k_vec[d]);
         }
-        scores[kv_pos] = dot * scale;
-    }
-    __syncthreads();
-
-    // Softmax: find max
-    float max_val = -FLT_MAX;
-    for (int i = tid; i < kv_len; i += stride) {
-        max_val = fmaxf(max_val, scores[i]);
-    }
-    // Warp reduce max
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
-    }
-    __shared__ float s_max;
-    if (tid == 0) s_max = max_val;
-    // Cross-warp reduce if needed
-    __shared__ float warp_maxes[32];
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-    if (lane_id == 0) warp_maxes[warp_id] = max_val;
-    __syncthreads();
-    if (warp_id == 0) {
-        float v = (lane_id < (stride / 32)) ? warp_maxes[lane_id] : -FLT_MAX;
+        // Warp reduce the dot product
         for (int offset = 16; offset > 0; offset >>= 1) {
-            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
         }
-        if (lane_id == 0) s_max = v;
-    }
-    __syncthreads();
-
-    // Softmax: exp and sum
-    float sum_exp = 0.0f;
-    for (int i = tid; i < kv_len; i += stride) {
-        scores[i] = expf(scores[i] - s_max);
-        sum_exp += scores[i];
-    }
-    // Reduce sum
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
-    }
-    __shared__ float s_sum;
-    __shared__ float warp_sums[32];
-    if (lane_id == 0) warp_sums[warp_id] = sum_exp;
-    __syncthreads();
-    if (warp_id == 0) {
-        float v = (lane_id < (stride / 32)) ? warp_sums[lane_id] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            v += __shfl_down_sync(0xffffffff, v, offset);
+        // Cross-warp reduce
+        __shared__ float warp_dots[32];
+        int warp_id = tid / 32;
+        int lane_id = tid % 32;
+        if (lane_id == 0) warp_dots[warp_id] = dot;
+        __syncthreads();
+        if (warp_id == 0) {
+            float v = (lane_id < (stride / 32)) ? warp_dots[lane_id] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, offset);
+            }
+            if (lane_id == 0) warp_dots[0] = v;
         }
-        if (lane_id == 0) s_sum = v;
-    }
-    __syncthreads();
+        __syncthreads();
+        float score = warp_dots[0] * scale;
 
-    // Normalize
-    float inv_sum = 1.0f / s_sum;
-    for (int i = tid; i < kv_len; i += stride) {
-        scores[i] *= inv_sum;
-    }
-    __syncthreads();
+        // Online softmax update
+        float new_max = fmaxf(thread_max, score);
+        float exp_score = expf(score - new_max);
+        float correction = expf(thread_max - new_max);
+        thread_sum = thread_sum * correction + exp_score;
 
-    // Weighted sum: output = sum(scores[i] * V[i])
+        // Update V accumulators with correction
+        const __nv_bfloat16* v_vec = v_cache + (int64_t)kv_pos * n_head_kv * head_dim + kv_head * head_dim;
+        int di = 0;
+        for (int d = tid; d < head_dim; d += stride, di++) {
+            acc[di] = acc[di] * correction + exp_score * __bfloat162float(v_vec[d]);
+        }
+        thread_max = new_max;
+    }
+
+    // Write output: acc / sum
     __nv_bfloat16* out_head = output + head * head_dim;
-    for (int d = tid; d < head_dim; d += stride) {
-        float acc = 0.0f;
-        for (int kv_pos = 0; kv_pos < kv_len; kv_pos++) {
-            const __nv_bfloat16* v_vec = v_cache + (int64_t)kv_pos * n_head_kv * head_dim + kv_head * head_dim;
-            acc += scores[kv_pos] * __bfloat162float(v_vec[d]);
-        }
-        out_head[d] = __float2bfloat16(acc);
+    float inv_sum = (thread_sum > 0.0f) ? 1.0f / thread_sum : 0.0f;
+    int di = 0;
+    for (int d = tid; d < head_dim; d += stride, di++) {
+        out_head[d] = __float2bfloat16(acc[di] * inv_sum);
     }
 }
 
@@ -342,9 +322,8 @@ void launch_attention_decode(
     float scale,
     cudaStream_t stream
 ) {
-    // One block per head, allocate smem for max possible kv_len (for graph capture)
+    // Online softmax kernel: uses static shared memory only, no dynamic allocation needed
     int threads = 256;
-    size_t smem = max_kv_len * sizeof(float);
-    attention_decode_kernel<<<n_head, threads, smem, stream>>>(
+    attention_decode_kernel<<<n_head, threads, 0, stream>>>(
         output, q, k_cache, v_cache, d_kv_len, n_head, n_head_kv, head_dim, scale);
 }
