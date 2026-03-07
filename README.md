@@ -16,11 +16,11 @@ Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (eve
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~950 ms/tok |
-| Decode throughput | ~1 tok/s |
+| Decode latency | ~280 ms/tok |
+| Decode throughput | ~3.6 tok/s |
 | Model size | ~18 GB BF16 |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). First token is slower (~1.1s) due to program cache warmup; subsequent tokens stabilize around 950ms.
+Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first run in a fresh build directory is slower (~500ms/tok) while tt-metal compiles and caches device kernels in `generated/`; subsequent runs stabilize at ~280ms/tok.
 
 ## Building
 
