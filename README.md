@@ -64,7 +64,7 @@ One-shot text completion.
 
 ## Server (`qwen-server`)
 
-OpenAI-compatible HTTP server.
+OpenAI-compatible HTTP server with a built-in chat UI at `/`.
 
 ```sh
 ./qwen-server -m unsloth/Qwen3.5-9B-GGUF:BF16
@@ -82,6 +82,7 @@ OpenAI-compatible HTTP server.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Chat UI (web browser) |
 | `/v1/chat/completions` | POST | OpenAI-compatible chat completions |
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Health check |
