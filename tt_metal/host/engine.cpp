@@ -522,9 +522,9 @@ static void cache_small_weights(MeshCommandQueue& cq) {
     }
 }
 
-// Upload host bf16 data to a device as a weight Tensor [M, K] in tiled BF16 layout
+// Upload host bf16 data to a device as a weight Tensor [M, K] in tiled layout
 static Tensor upload_bf16_weight(MeshDevice* device, const uint16_t* bf16_data,
-                                  uint32_t M, uint32_t K) {
+                                  uint32_t M, uint32_t K, DataType dtype = DataType::BFLOAT8_B) {
     // Convert bf16 (uint16) to float for from_span
     size_t n = (size_t)M * K;
     std::vector<float> f32(n);
@@ -533,39 +533,76 @@ static Tensor upload_bf16_weight(MeshDevice* device, const uint16_t* bf16_data,
 
     TensorSpec spec(
         Shape({1, 1, M, K}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+        TensorLayout(dtype, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
     return Tensor::from_span<float>(std::span<const float>(f32.data(), n), spec, device);
+}
+
+// Read a BF16 tiled MeshBuffer back to host as flat f32 vector [M * K]
+static std::vector<float> read_bf16_buf_to_f32(MeshCommandQueue& cq,
+    std::shared_ptr<MeshBuffer> buf, uint32_t M, uint32_t K) {
+    std::vector<bfloat16> tiled;
+    EnqueueReadMeshBuffer(cq, tiled, buf, true);
+    uint32_t M_pad = ((M + TILE_HEIGHT - 1) / TILE_HEIGHT) * TILE_HEIGHT;
+    uint32_t K_pad = ((K + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
+    auto flat = untilize_nfaces(tiled, M_pad, K_pad);
+    std::vector<float> f32(M * K);
+    for (uint32_t r = 0; r < M; r++)
+        for (uint32_t c = 0; c < K; c++)
+            f32[r * K + c] = static_cast<float>(flat[r * K_pad + c]);
+    return f32;
+}
+
+// Re-upload a BF16 device MeshBuffer as a BFLOAT8_B Tensor (halves DRAM usage)
+static Tensor convert_to_bfp8(MeshDevice* device, MeshCommandQueue& cq,
+                                std::shared_ptr<MeshBuffer>& buf, uint32_t M, uint32_t K) {
+    auto f32 = read_bf16_buf_to_f32(cq, buf, M, K);
+    buf.reset();  // free old BF16 buffer
+    TensorSpec spec(
+        Shape({1, 1, M, K}),
+        TensorLayout(DataType::BFLOAT8_B, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+    return Tensor::from_span<float>(std::span<const float>(f32.data(), f32.size()), spec, device);
 }
 
 // Create Tensor wrappers for all on-device weight MeshBuffers
 static void create_weight_tensors() {
-    // Chip 0: layer weights (already on device via GGUF loader)
+    auto& cq0 = g_mesh->mesh_command_queue();
+
+    // Re-upload chip 0 weights as BFLOAT8_B (halves DRAM reads, ~2x bandwidth)
+    printf("Converting chip 0 weights to BFLOAT8_B...\n");
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
         if (MC::is_recurrent(layer)) {
             auto& lw = g_model.ssm_layers[ssm_idx];
             uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
                                    + MC::ssm_dt_rank + MC::ssm_dt_rank;
-            g_wt.ssm_w_combined[ssm_idx] = wrap_weight(lw.w_combined, combined_rows, MC::n_embd);
-            g_wt.ssm_ffn_gate_up[ssm_idx] = wrap_weight(lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
-            g_wt.ssm_ffn_down[ssm_idx] = wrap_weight(lw.ffn_down, MC::n_embd, MC::n_ff);
+            g_wt.ssm_w_combined[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                             lw.w_combined, combined_rows, MC::n_embd);
+            g_wt.ssm_ffn_gate_up[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                               lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
+            g_wt.ssm_ffn_down[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                            lw.ffn_down, MC::n_embd, MC::n_ff);
+            if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d converted\n", ssm_idx);
             ssm_idx++;
         } else {
             auto& lw = g_model.attn_layers[attn_idx];
             int q_dim = MC::n_head * MC::head_dim * 2;
             int kv_dim_one = MC::n_head_kv * MC::head_dim;
             int qkv_rows = q_dim + 2 * kv_dim_one;
-            g_wt.attn_wqkv[attn_idx] = wrap_weight(lw.wqkv, qkv_rows, MC::n_embd);
-            g_wt.attn_ffn_gate_up[attn_idx] = wrap_weight(lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
-            g_wt.attn_ffn_down[attn_idx] = wrap_weight(lw.ffn_down, MC::n_embd, MC::n_ff);
+            g_wt.attn_wqkv[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                          lw.wqkv, qkv_rows, MC::n_embd);
+            g_wt.attn_ffn_gate_up[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                                 lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
+            g_wt.attn_ffn_down[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
+                                                              lw.ffn_down, MC::n_embd, MC::n_ff);
+            printf("  Attn layer %d converted\n", attn_idx);
             attn_idx++;
         }
     }
-    printf("Created %d attention + %d SSM weight tensor wrappers on chip 0.\n",
+    printf("Converted %d attention + %d SSM weight tensors to BFLOAT8_B on chip 0.\n",
            attn_idx, ssm_idx);
 
-    // Chip 1: wo, ssm_out, LM head (uploaded from host bf16 vectors)
-    printf("Uploading output projections to chip 1...\n");
+    // Chip 1: wo, ssm_out, LM head (uploaded from host bf16 as BFLOAT8_B)
+    printf("Uploading output projections to chip 1 as BFLOAT8_B...\n");
     for (int i = 0; i < 8; i++) {
         auto& lw = g_model.attn_layers[i];
         g_wt.attn_wo[i] = upload_bf16_weight(g_mesh2.get(), lw.wo_host.data(),
@@ -582,13 +619,13 @@ static void create_weight_tensors() {
                                        MC::n_vocab, MC::n_embd);
     printf("  lm_head uploaded\n");
 
-    // Free host bf16 vectors now that weights are on chip 1
+    // Free host bf16 vectors now that weights are on device
     for (int i = 0; i < 8; i++)
         g_model.attn_layers[i].wo_host.clear();
     for (int i = 0; i < 24; i++)
         g_model.ssm_layers[i].ssm_out_host.clear();
     g_model.output_host.clear();
-    printf("Freed host bf16 vectors (wo, ssm_out, output) — saved ~2.9 GB host RAM\n");
+    printf("Freed host bf16 vectors — saved ~2.9 GB host RAM\n");
 
     // Wrap norm weights as device Tensors for on-device RMSNorm
     printf("Creating norm weight tensors...\n");
