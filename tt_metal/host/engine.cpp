@@ -163,33 +163,46 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
     return ins->second;
 }
 
+// Fast bf16↔f32 conversion using raw bit operations (avoids bfloat16 class overhead)
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    return static_cast<uint16_t>(bits >> 16);
+}
+static inline float bf16_to_f32(uint16_t b) {
+    uint32_t bits = static_cast<uint32_t>(b) << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
 // ============================================================================
 // Device-side GEMV: y[M] = W[M,K] @ x[K]  (W on device, x/y on host)
 // Pre-allocated buffers eliminate per-call alloc/dealloc overhead.
 // ============================================================================
+// Pre-allocated bf16 scratch for bulk conversion (max possible K or M)
+static std::vector<uint16_t> g_bf16_scratch(MC::n_vocab_padded);
+
 static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, uint32_t K,
                         const float* x, float* y) {
     auto& gb = get_gemv_buf(device, M, K);
     auto& cq = device->mesh_command_queue();
 
-    // 1. Fast tilize activation [1, K] into pre-allocated host buffer
-    auto& ht = gb.act_host_tiled;
-    uint32_t TW = TILE_WIDTH, TH = TILE_HEIGHT;
-    uint32_t num_tile_cols = gb.K_padded / TW;
+    // 1. Bulk convert f32→bf16, then scatter into tile positions via memcpy
+    uint16_t* scratch = g_bf16_scratch.data();
+    const uint32_t* xbits = reinterpret_cast<const uint32_t*>(x);
+    for (uint32_t i = 0; i < K; i++)
+        scratch[i] = static_cast<uint16_t>(xbits[i] >> 16);
+
+    uint16_t* ht = reinterpret_cast<uint16_t*>(gb.act_host_tiled.data());
+    uint32_t num_tile_cols = gb.K_padded / TILE_WIDTH;
     for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
-        uint32_t tile_offset = tc * TH * TW;
-        // Face 0, row 0 (cols 0-15)
-        for (uint32_t j = 0; j < 16 && tc * TW + j < K; j++)
-            ht[tile_offset + j] = bfloat16(x[tc * TW + j]);
-        for (uint32_t j = K - tc * TW; j < 16; j++)
-            ht[tile_offset + j] = bfloat16(0.0f);
-        // Face 1, row 0 (cols 16-31)
-        for (uint32_t j = 0; j < 16 && tc * TW + 16 + j < K; j++)
-            ht[tile_offset + 256 + j] = bfloat16(x[tc * TW + 16 + j]);
-        for (uint32_t j = K - (tc * TW + 16); j < 16; j++)
-            if (tc * TW + 16 + j >= K) ht[tile_offset + 256 + j] = bfloat16(0.0f);
+        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+        uint32_t base = tc * TILE_WIDTH;
+        memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
+        memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
     }
-    EnqueueWriteMeshBuffer(cq, gb.act_buf, ht, false);
+    EnqueueWriteMeshBuffer(cq, gb.act_buf, gb.act_host_tiled, false);
 
     // 2. matmul: [1,1,1,K] × [1,1,M,K]^T = [1,1,1,M]
     ttnn::matmul(gb.act_tensor, weight,
@@ -203,18 +216,21 @@ static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, ui
                  /*output_tile=*/std::nullopt,
                  /*optional_output_tensor=*/gb.out_tensor);
 
-    // 3. Read result and untilize
-    auto& oht = gb.out_host_tiled;
-    EnqueueReadMeshBuffer(cq, oht, gb.out_buf, true);
+    // 3. Read result, gather row 0 from tiles via memcpy, bulk convert bf16→f32
+    EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
 
-    uint32_t out_tile_cols = gb.M_padded / TW;
-    for (uint32_t tc = 0; tc < out_tile_cols && tc * TW < M; tc++) {
-        uint32_t tile_offset = tc * TH * TW;
-        for (uint32_t j = 0; j < 16 && tc * TW + j < M; j++)
-            y[tc * TW + j] = static_cast<float>(oht[tile_offset + j]);
-        for (uint32_t j = 0; j < 16 && tc * TW + 16 + j < M; j++)
-            y[tc * TW + 16 + j] = static_cast<float>(oht[tile_offset + 256 + j]);
+    const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
+    uint32_t out_tile_cols = gb.M_padded / TILE_WIDTH;
+    for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+        uint32_t base = tc * TILE_WIDTH;
+        memcpy(scratch + base, oht + tile_off, 16 * sizeof(uint16_t));
+        memcpy(scratch + base + 16, oht + tile_off + 256, 16 * sizeof(uint16_t));
     }
+    // Bulk bf16→f32 conversion
+    uint32_t* ybits = reinterpret_cast<uint32_t*>(y);
+    for (uint32_t i = 0; i < M; i++)
+        ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
 }
 
 // ============================================================================
@@ -375,43 +391,63 @@ static void create_weight_tensors() {
 }
 
 // ============================================================================
+// Pre-allocated scratch buffers for forward_decode (avoid heap allocs per token)
+// ============================================================================
+static std::vector<float> g_norm_out(MC::n_embd);
+static std::vector<float> g_residual(MC::n_embd);
+static constexpr int g_combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
+                                     + MC::ssm_dt_rank + MC::ssm_dt_rank;
+static std::vector<float> g_proj(g_combined_rows);
+static std::vector<float> g_conv_out(MC::ssm_conv_channels);
+static std::vector<float> g_delta_out(MC::ssm_d_inner);
+static std::vector<float> g_ssm_proj_in(MC::ssm_d_inner);
+static std::vector<float> g_layer_out(MC::n_embd);
+static std::vector<float> g_ffn_buf(2 * MC::n_ff);
+static std::vector<float> g_ffn_act(MC::n_ff);
+static std::vector<float> g_ffn_out(MC::n_embd);
+static constexpr int g_qkv_rows = MC::n_head * MC::head_dim * 2 + 2 * MC::n_head_kv * MC::head_dim;
+static std::vector<float> g_qkv(g_qkv_rows);
+static std::vector<float> g_q_heads(MC::n_head * MC::head_dim);
+static std::vector<float> g_gate_heads(MC::n_head * MC::head_dim);
+static std::vector<float> g_attn_out(MC::n_head * MC::head_dim);
+static std::vector<float> g_acc(MC::head_dim);
+static std::vector<float> g_logits(MC::n_vocab);
+
+// ============================================================================
 // Forward pass: single decode token
 // Large matmuls on device via ttnn::matmul, small ops on host CPU.
 // ============================================================================
 static std::vector<float> forward_decode() {
     int pos = g_pos;
-    std::vector<float> norm_out(MC::n_embd);
-    std::vector<float> residual(MC::n_embd);
+    float* norm_out = g_norm_out.data();
+    float* residual = g_residual.data();
 
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
         auto& ln = g_layer_norms[layer];
 
         // Save residual
-        memcpy(residual.data(), g_hidden_f32.data(), MC::n_embd * sizeof(float));
+        memcpy(residual, g_hidden_f32.data(), MC::n_embd * sizeof(float));
 
         // Pre-norm
-        rmsnorm(g_hidden_f32.data(), ln.attn_norm.data(), norm_out.data(), MC::n_embd);
+        rmsnorm(g_hidden_f32.data(), ln.attn_norm.data(), norm_out, MC::n_embd);
 
         if (MC::is_recurrent(layer)) {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
             // 1. Combined projection via DEVICE matmul
-            int combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
-                              + MC::ssm_dt_rank + MC::ssm_dt_rank;
-            std::vector<float> proj(combined_rows);
-            device_gemv(g_mesh.get(), g_wt.ssm_w_combined[ssm_idx], combined_rows, MC::n_embd,
-                       norm_out.data(), proj.data());
+            device_gemv(g_mesh.get(), g_wt.ssm_w_combined[ssm_idx], g_combined_rows, MC::n_embd,
+                       norm_out, g_proj.data());
 
-            float* qkv_raw = proj.data();
-            float* z_raw = proj.data() + MC::ssm_conv_channels;
+            float* qkv_raw = g_proj.data();
+            float* z_raw = g_proj.data() + MC::ssm_conv_channels;
             float* alpha_raw = z_raw + MC::ssm_d_inner;
             float* beta_raw = alpha_raw + MC::ssm_dt_rank;
 
             // 2. Conv1d + SiLU
             auto& cs = g_conv_state[ssm_idx];
-            std::vector<float> conv_out(MC::ssm_conv_channels);
+            float* conv_out = g_conv_out.data();
             for (int ch = 0; ch < MC::ssm_conv_channels; ch++) {
                 float sum = 0;
                 for (int k = 0; k < MC::ssm_conv_kernel; k++) {
@@ -436,13 +472,13 @@ static std::vector<float> forward_decode() {
             constexpr int num_v = ssm_n_v_heads;
             constexpr int head_v = ssm_head_v_dim_c;
 
-            float* conv_q = conv_out.data();
-            float* conv_k = conv_out.data() + num_k_heads * head_k;
-            float* conv_v = conv_out.data() + 2 * num_k_heads * head_k;
+            float* conv_q = conv_out;
+            float* conv_k = conv_out + num_k_heads * head_k;
+            float* conv_v = conv_out + 2 * num_k_heads * head_k;
 
             // 4. Delta-net recurrence
             auto& state = g_ssm_state[ssm_idx];
-            std::vector<float> delta_out(MC::ssm_d_inner);
+            float* delta_out = g_delta_out.data();
             constexpr float ssm_scale = 1.0f / 11.3137f;  // 1/sqrt(128)
 
             for (int vh = 0; vh < num_v; vh++) {
@@ -486,7 +522,7 @@ static std::vector<float> forward_decode() {
             }
 
             // 5. Gated RMSNorm (ssm_norm is [128], broadcast across all v_heads)
-            std::vector<float> ssm_proj_in(MC::ssm_d_inner);
+            float* ssm_proj_in = g_ssm_proj_in.data();
             for (int vh = 0; vh < num_v; vh++) {
                 float sum_sq = 0;
                 for (int d = 0; d < head_v; d++) {
@@ -504,33 +540,33 @@ static std::vector<float> forward_decode() {
             }
 
             // 6. Output projection (DEVICE matmul on chip 1)
-            std::vector<float> layer_out(MC::n_embd);
+            float* layer_out = g_layer_out.data();
             device_gemv(g_mesh2.get(), g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                       ssm_proj_in.data(), layer_out.data());
+                       ssm_proj_in, layer_out);
 
             // 7. Residual
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + layer_out[i];
 
-            memcpy(residual.data(), g_hidden_f32.data(), MC::n_embd * sizeof(float));
+            memcpy(residual, g_hidden_f32.data(), MC::n_embd * sizeof(float));
 
             // 8. Post-norm + FFN (DEVICE matmul)
-            rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out.data(), MC::n_embd);
+            rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out, MC::n_embd);
 
-            std::vector<float> ffn_buf(2 * MC::n_ff);
+            float* ffn_buf = g_ffn_buf.data();
             device_gemv(g_mesh.get(), g_wt.ssm_ffn_gate_up[ssm_idx], 2 * MC::n_ff, MC::n_embd,
-                       norm_out.data(), ffn_buf.data());
+                       norm_out, ffn_buf);
 
-            std::vector<float> ffn_act(MC::n_ff);
+            float* ffn_act = g_ffn_act.data();
             for (int i = 0; i < MC::n_ff; i++) {
                 float g = ffn_buf[i];
                 float u = ffn_buf[MC::n_ff + i];
                 ffn_act[i] = (g / (1.0f + expf(-g))) * u;
             }
 
-            std::vector<float> ffn_out(MC::n_embd);
+            float* ffn_out = g_ffn_out.data();
             device_gemv(g_mesh.get(), g_wt.ssm_ffn_down[ssm_idx], MC::n_embd, MC::n_ff,
-                       ffn_act.data(), ffn_out.data());
+                       ffn_act, ffn_out);
 
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + ffn_out[i];
@@ -542,28 +578,27 @@ static std::vector<float> forward_decode() {
             auto& aw = g_attn_small[attn_idx];
 
             // 1. QKV projection (DEVICE matmul)
-            int q_dim = MC::n_head * MC::head_dim * 2;
-            int kv_dim_one = MC::n_head_kv * MC::head_dim;
-            int total_rows = q_dim + 2 * kv_dim_one;
-            std::vector<float> qkv(total_rows);
-            device_gemv(g_mesh.get(), g_wt.attn_wqkv[attn_idx], total_rows, MC::n_embd,
-                       norm_out.data(), qkv.data());
+            constexpr int q_dim = MC::n_head * MC::head_dim * 2;
+            constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
+            float* qkv = g_qkv.data();
+            device_gemv(g_mesh.get(), g_wt.attn_wqkv[attn_idx], g_qkv_rows, MC::n_embd,
+                       norm_out, qkv);
 
             // 2. Deinterleave Q and gate
-            std::vector<float> q_heads(MC::n_head * MC::head_dim);
-            std::vector<float> gate_heads(MC::n_head * MC::head_dim);
+            float* q_heads = g_q_heads.data();
+            float* gate_heads = g_gate_heads.data();
             for (int h = 0; h < MC::n_head; h++) {
                 for (int d = 0; d < MC::head_dim; d++) {
                     q_heads[h * MC::head_dim + d] = qkv[h * MC::head_dim * 2 + d];
                     gate_heads[h * MC::head_dim + d] = qkv[h * MC::head_dim * 2 + MC::head_dim + d];
                 }
             }
-            float* k_proj = qkv.data() + q_dim;
+            float* k_proj = qkv + q_dim;
             float* v_proj = k_proj + kv_dim_one;
 
             // 3. Per-head Q/K RMSNorm
             for (int h = 0; h < MC::n_head; h++) {
-                float* qh = q_heads.data() + h * MC::head_dim;
+                float* qh = q_heads + h * MC::head_dim;
                 float ss = 0;
                 for (int d = 0; d < MC::head_dim; d++) ss += qh[d] * qh[d];
                 float rms = 1.0f / sqrtf(ss / MC::head_dim + MC::rms_norm_eps);
@@ -581,7 +616,7 @@ static std::vector<float> forward_decode() {
 
             // 4. RoPE
             for (int h = 0; h < MC::n_head; h++)
-                apply_rope(q_heads.data() + h * MC::head_dim, pos);
+                apply_rope(q_heads + h * MC::head_dim, pos);
             for (int h = 0; h < MC::n_head_kv; h++)
                 apply_rope(k_proj + h * MC::head_dim, pos);
 
@@ -593,13 +628,15 @@ static std::vector<float> forward_decode() {
             int kv_len = pos + 1;
 
             // 6. Attention (online softmax)
-            std::vector<float> attn_out(MC::n_head * MC::head_dim, 0.0f);
+            float* attn_out = g_attn_out.data();
+            memset(attn_out, 0, MC::n_head * MC::head_dim * sizeof(float));
             for (int h = 0; h < MC::n_head; h++) {
                 int kv_h = h / (MC::n_head / MC::n_head_kv);
-                float* qh = q_heads.data() + h * MC::head_dim;
-                float* out = attn_out.data() + h * MC::head_dim;
+                float* qh = q_heads + h * MC::head_dim;
+                float* out = attn_out + h * MC::head_dim;
                 float max_score = -FLT_MAX, sum_exp = 0;
-                std::vector<float> acc(MC::head_dim, 0.0f);
+                float* acc = g_acc.data();
+                memset(acc, 0, MC::head_dim * sizeof(float));
 
                 for (int kp = 0; kp < kv_len; kp++) {
                     float* kh = g_k_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
@@ -625,33 +662,33 @@ static std::vector<float> forward_decode() {
                 attn_out[i] *= 1.0f / (1.0f + expf(-gate_heads[i]));
 
             // 8. Output projection (DEVICE matmul on chip 1)
-            std::vector<float> layer_out(MC::n_embd);
+            float* layer_out = g_layer_out.data();
             device_gemv(g_mesh2.get(), g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                       attn_out.data(), layer_out.data());
+                       attn_out, layer_out);
 
             // 9. Residual
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + layer_out[i];
 
-            memcpy(residual.data(), g_hidden_f32.data(), MC::n_embd * sizeof(float));
+            memcpy(residual, g_hidden_f32.data(), MC::n_embd * sizeof(float));
 
             // 10. Post-norm + FFN (DEVICE matmul)
-            rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out.data(), MC::n_embd);
+            rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out, MC::n_embd);
 
-            std::vector<float> ffn_buf(2 * MC::n_ff);
+            float* ffn_buf = g_ffn_buf.data();
             device_gemv(g_mesh.get(), g_wt.attn_ffn_gate_up[attn_idx], 2 * MC::n_ff, MC::n_embd,
-                       norm_out.data(), ffn_buf.data());
+                       norm_out, ffn_buf);
 
-            std::vector<float> ffn_act(MC::n_ff);
+            float* ffn_act = g_ffn_act.data();
             for (int i = 0; i < MC::n_ff; i++) {
                 float g = ffn_buf[i];
                 float u = ffn_buf[MC::n_ff + i];
                 ffn_act[i] = (g / (1.0f + expf(-g))) * u;
             }
 
-            std::vector<float> ffn_out(MC::n_embd);
+            float* ffn_out = g_ffn_out.data();
             device_gemv(g_mesh.get(), g_wt.attn_ffn_down[attn_idx], MC::n_embd, MC::n_ff,
-                       ffn_act.data(), ffn_out.data());
+                       ffn_act, ffn_out);
 
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + ffn_out[i];
@@ -661,14 +698,14 @@ static std::vector<float> forward_decode() {
     }
 
     // Final norm
-    rmsnorm(g_hidden_f32.data(), g_output_norm.data(), norm_out.data(), MC::n_embd);
+    rmsnorm(g_hidden_f32.data(), g_output_norm.data(), norm_out, MC::n_embd);
 
     // LM head (DEVICE matmul on chip 1)
-    std::vector<float> logits(MC::n_vocab);
+    float* logits = g_logits.data();
     device_gemv(g_mesh2.get(), g_wt.lm_head, MC::n_vocab, MC::n_embd,
-               norm_out.data(), logits.data());
+               norm_out, logits);
 
-    return logits;
+    return std::vector<float>(logits, logits + MC::n_vocab);
 }
 
 // ============================================================================

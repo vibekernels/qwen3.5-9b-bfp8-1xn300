@@ -42,6 +42,7 @@ target_include_directories(test_load_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 add_library(qwen_engine STATIC host/engine.cpp host/gguf_loader.cpp ../src/tokenizer.cpp)
 target_link_libraries(qwen_engine PUBLIC TT::Metalium)
 target_include_directories(qwen_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/host ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(qwen_engine PRIVATE -march=native -ffast-math)
 
 # Link ttnn C++ library for device-side ops (matmul, rmsnorm, etc.)
 target_link_libraries(qwen_engine PUBLIC ${TT_METAL_BUILD}/lib/_ttnncpp.so)
