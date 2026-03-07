@@ -27,6 +27,25 @@ make -j$(nproc)
 
 This produces two binaries: `qwen-inference` (CLI) and `qwen-server` (HTTP server).
 
+## Testing
+
+```sh
+make test          # run all tests
+make test-cpu      # UTF-8 streaming + tokenizer tests (no GPU needed, downloads model for tokenizer)
+make test-gpu      # inference integration tests (requires GPU, auto-downloads model)
+```
+
+GPU tests run at both small (4096) and full (262144) context sizes to exercise different attention kernels.
+
+### Performance thresholds
+
+| Context | Decode tok/s | Prefill tok/s |
+|---------|-------------|---------------|
+| 4096 (small) | ≥ 92 | ≥ 2000 |
+| 262144 (full) | ≥ 87 | ≥ 1500 |
+
+Override with env vars: `MIN_TOK_PER_SEC`, `MIN_PREFILL_TOK_PER_SEC`, `TEST_CTX_SIZE`, `MODEL_PATH`.
+
 ## CLI (`qwen-inference`)
 
 One-shot text completion.
