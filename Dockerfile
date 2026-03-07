@@ -3,7 +3,7 @@ FROM --platform=linux/amd64 nvidia/cuda:12.8.0-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SHELL=/bin/bash
 
-ARG REPO_URL=https://github.com/vibekernels/qwen3.5-9b-1x5090.git
+ARG REPO_URL=https://github.com/vibekernels/qwen3.5-9b-bf16-1x5090.git
 ARG COMMIT_SHA=main
 
 # Install essentials + SSH
@@ -17,14 +17,14 @@ RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
     && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
 # Clone repo at the exact commit that triggered the build
-RUN git clone "$REPO_URL" /root/qwen3.5-9b-1x5090 \
-    && cd /root/qwen3.5-9b-1x5090 \
+RUN git clone "$REPO_URL" /root/qwen3.5-9b-bf16-1x5090 \
+    && cd /root/qwen3.5-9b-bf16-1x5090 \
     && git checkout "$COMMIT_SHA"
 
 # Build the inference binary
-RUN cd /root/qwen3.5-9b-1x5090 && make -j$(nproc)
+RUN cd /root/qwen3.5-9b-bf16-1x5090 && make -j$(nproc)
 
-WORKDIR /root/qwen3.5-9b-1x5090
+WORKDIR /root/qwen3.5-9b-bf16-1x5090
 
 # Startup script: configure SSH, start server (auto-downloads model)
 RUN printf '#!/bin/bash\n\
@@ -43,7 +43,7 @@ grep -q "source /etc/rp_environment" /root/.bashrc 2>/dev/null || \\\n\
 \n\
 HF_MODEL="${HF_MODEL:-unsloth/Qwen3.5-9B-GGUF:BF16}"\n\
 echo "Starting qwen-server with model: $HF_MODEL"\n\
-/root/qwen3.5-9b-1x5090/qwen-server -m "$HF_MODEL" --host 0.0.0.0 --port 8080 || \\\n\
+/root/qwen3.5-9b-bf16-1x5090/qwen-server -m "$HF_MODEL" --host 0.0.0.0 --port 8080 || \\\n\
   (echo "Server failed to start, keeping container alive for debugging" && sleep infinity)\n\
 ' > /start.sh && chmod +x /start.sh
 

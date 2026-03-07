@@ -1,14 +1,14 @@
-# qwen3.5-9b-1x5090
+# qwen3.5-9b-bf16-1x5090
 
 Custom CUDA inference engine for Qwen3.5-9B on a single RTX 5090, built from scratch with hand-written kernels (no frameworks).
 
 ## RunPod (Docker)
 
-Every push to `main` builds a Docker image at `ghcr.io/vibekernels/qwen3.5-9b-1x5090:latest`.
+Every push to `main` builds a Docker image at `ghcr.io/vibekernels/qwen3.5-9b-bf16-1x5090:latest`.
 
 Create a RunPod GPU pod with:
 
-- **Container Image:** `ghcr.io/vibekernels/qwen3.5-9b-1x5090:latest`
+- **Container Image:** `ghcr.io/vibekernels/qwen3.5-9b-bf16-1x5090:latest`
 - **Container Disk:** 40 GB+ (for model weights)
 - **Expose HTTP Ports:** `8080`
 - **Expose TCP Ports:** `22` (for SSH)
