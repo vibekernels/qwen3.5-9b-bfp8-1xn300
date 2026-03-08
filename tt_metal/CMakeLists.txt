@@ -57,3 +57,7 @@ target_link_libraries(test_forward PRIVATE qwen_engine)
 add_executable(test_bandwidth /tmp/test_bandwidth2.cpp)
 target_link_libraries(test_bandwidth PRIVATE TT::Metalium ${TT_METAL_BUILD}/lib/_ttnncpp.so)
 target_include_directories(test_bandwidth PRIVATE ${TT_METAL_BUILD}/include)
+
+# Mesh overhead benchmark
+add_executable(test_mesh_overhead tests/test_mesh_overhead.cpp)
+target_link_libraries(test_mesh_overhead PRIVATE TT::Metalium)

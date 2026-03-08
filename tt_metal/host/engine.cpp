@@ -24,6 +24,7 @@
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/buffer_distribution_spec.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -58,6 +59,10 @@ static Tokenizer g_tokenizer;
 static bool g_loaded = false;
 static int g_max_ctx = 0;
 static int g_pos = 0;
+
+// DRAM bank topology for sharded GEMV
+static uint32_t g_num_dram_banks = 0;
+static std::vector<CoreCoord> g_dram_workers;  // optimal Tensix worker per DRAM bank
 
 // Host-side f32 hidden state
 static std::vector<float> g_hidden_f32(MC::n_embd);
@@ -167,10 +172,14 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
     GemvBuf buf;
     uint32_t TW = TILE_WIDTH, TH = TILE_HEIGHT;
     buf.K_padded = ((K + TW - 1) / TW) * TW;
-    buf.M_padded = ((M + TW - 1) / TW) * TW;
+    // Pad M to next multiple of num_dram_banks for DRAM-sharded dispatch
+    uint32_t Mt_raw = (M + TH - 1) / TH;
+    uint32_t nbanks = (g_num_dram_banks > 0) ? g_num_dram_banks : 12;
+    uint32_t Mt_padded = ((Mt_raw + nbanks - 1) / nbanks) * nbanks;
+    buf.M_padded = Mt_padded * TH;
 
     uint32_t act_tiles = buf.K_padded / TW;
-    uint32_t out_tiles = buf.M_padded / TW;
+    uint32_t out_tiles = Mt_padded;
     uint32_t tile_bytes = TH * TW * sizeof(bfloat16);
 
     DeviceLocalBufferConfig dram_cfg{.page_size = tile_bytes, .buffer_type = BufferType::DRAM};
@@ -407,12 +416,10 @@ struct CachedGemvWorkload {
 };
 static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedGemvWorkload> g_gemv_cache;
 
-// Multi-core GEMV: y[1,M] = x[1,K] @ W[M,K]^T
-// Distributes Mt output tile-rows across all available Tensix cores.
-// Each core reads all Kt activation tiles + its slice of weight tiles.
-// act_buf: [1, K_padded] BF16 activation on device
-// weight_buf: [M_padded, K_padded] BFP8_B weight on device
-// out_buf: [1, M_padded] BF16 output on device
+// DRAM-sharded GEMV: y[1,M] = x[1,K] @ W[M,K]^T
+// Uses 12 DRAM-optimal cores (one per bank) for maximum bandwidth.
+// Weight buffer is DRAM-sharded: each bank stores Mt_per_bank × Kt contiguous tiles.
+// Each core reads activations from interleaved buf, weights from its assigned bank.
 static void dispatch_gemv(MeshDevice* device,
                            std::shared_ptr<MeshBuffer> act_buf,
                            std::shared_ptr<MeshBuffer> weight_buf,
@@ -429,96 +436,89 @@ static void dispatch_gemv(MeshDevice* device,
 
         uint32_t Kt = K / TILE_WIDTH;
         uint32_t Mt = M / TILE_HEIGHT;
+        uint32_t num_banks = g_num_dram_banks;
+        uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
 
-        // Use all available cores
-        auto grid = device->compute_with_storage_grid_size();
-        uint32_t max_cores = grid.x * grid.y;  // 56 on Wormhole
-        uint32_t num_cores = std::min(max_cores, Mt);  // Don't use more cores than tiles
-        if (num_cores == 0) num_cores = 1;
-
-        // Compute tiles per core (some cores get +1 for remainder)
-        uint32_t base_per_core = Mt / num_cores;
-        uint32_t remainder = Mt % num_cores;
-
-        // Create core range spanning num_cores (row-major in grid)
-        uint32_t end_x = (num_cores <= grid.x) ? num_cores - 1 : grid.x - 1;
-        uint32_t end_y = (num_cores <= grid.x) ? 0 : (num_cores - 1) / grid.x;
-        CoreRange core_range({0, 0}, {end_x, end_y});
+        // Build CoreRangeSet from optimal DRAM workers (non-rectangular)
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = g_dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
 
         Program program = CreateProgram();
 
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
+        // BLOCK=16 empirically optimal (tested 4, 16, 64, 128)
+        uint32_t effective_block = 16;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for TRID pipelining
+
         // Activation CB: Kt tiles (loaded once, reused for all output rows)
         CircularBufferConfig cb_act_cfg =
             CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_0, bf16_tile_bytes);
-        CreateCircularBuffer(program, core_range, cb_act_cfg);
+        CreateCircularBuffer(program, all_cores, cb_act_cfg);
 
-        // Weight CB: 8 tiles for batched NOC reads + compute overlap
-        constexpr uint32_t WEIGHT_CB_TILES = 8;
+        // Weight CB: sized for double-buffered block reads
         CircularBufferConfig cb_weight_cfg =
-            CircularBufferConfig(WEIGHT_CB_TILES * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+            CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
                 .set_page_size(CBIndex::c_1, weight_tile_bytes);
-        CreateCircularBuffer(program, core_range, cb_weight_cfg);
+        CreateCircularBuffer(program, all_cores, cb_weight_cfg);
 
         // Output CB: 2 tiles
         CircularBufferConfig cb_out_cfg =
             CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_16, bf16_tile_bytes);
-        CreateCircularBuffer(program, core_range, cb_out_cfg);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
 
-        // Reader kernel (multi-core): reads all act tiles + weight slice
-        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt};
+        // DRAM-sharded reader: reads act from interleaved buf, weight from assigned bank
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
         TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
-        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
 
         auto reader_kid = CreateKernel(program,
-            kernel_path("dataflow/reader_gemv_multicore.cpp"), core_range,
+            kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
             DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                                .noc = NOC::RISCV_1_default,
                                .compile_args = reader_ct_args});
 
-        // Compute kernel: Kt is compile-time, Mt_per_core is runtime
-        std::vector<uint32_t> compute_ct_args = {Kt};
+        // Compute kernel: Kt and BLOCK are compile-time, Mt_per_core is runtime
+        std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
-            kernel_path("compute/gemv.cpp"), core_range,
+            kernel_path("compute/gemv.cpp"), all_cores,
             ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
 
-        // Writer kernel (multi-core): writes output slice
+        // Writer kernel: writes output tiles to interleaved out_buf
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
         TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
 
         auto writer_kid = CreateKernel(program,
-            kernel_path("dataflow/writer_gemv_multicore.cpp"), core_range,
+            kernel_path("dataflow/writer_gemv_multicore.cpp"), all_cores,
             DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                .noc = NOC::RISCV_0_default,
                                .compile_args = writer_ct_args});
 
-        // Set per-core runtime args
-        uint32_t tile_offset = 0;
-        for (uint32_t c = 0; c < num_cores; c++) {
-            uint32_t core_x = c % grid.x;
-            uint32_t core_y = c / grid.x;
-            CoreCoord core_coord(core_x, core_y);
+        // Set per-core runtime args (one core per DRAM bank)
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = g_dram_workers[b];
+            uint32_t start_row = b * Mt_per_bank;
+            uint32_t mt_this_core = (start_row >= Mt) ? 0 :
+                                    std::min(Mt_per_bank, Mt - start_row);
 
-            uint32_t mt_this_core = base_per_core + (c < remainder ? 1 : 0);
-
-            // Reader: [act_addr, weight_addr, Mt_per_core, weight_start_tile]
-            SetRuntimeArgs(program, reader_kid, core_coord,
+            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id]
+            SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, tile_offset});
+                            mt_this_core, b});
 
             // Compute: [Mt_per_core]
-            SetRuntimeArgs(program, compute_kid, core_coord,
+            SetRuntimeArgs(program, compute_kid, core,
                            {mt_this_core});
 
             // Writer: [dst_addr, Mt_per_core, out_start_tile]
-            SetRuntimeArgs(program, writer_kid, core_coord,
-                           {(uint32_t)out_buf->address(), mt_this_core, tile_offset});
-
-            tile_offset += mt_this_core;
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)out_buf->address(), mt_this_core, start_row});
         }
 
         cached.workload = MeshWorkload();
@@ -852,7 +852,7 @@ static void write_f32_to_buf(std::shared_ptr<MeshBuffer> buf, const float* data,
 // Read gemv output buffer to host f32 (fused untilize + bf16→f32 via AVX-512)
 static void read_gemv_to_f32(GemvBuf& gb, float* out, uint32_t M) {
     const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
-    uint32_t out_tile_cols = gb.M_padded / TILE_WIDTH;
+    uint32_t out_tile_cols = (M + TILE_WIDTH - 1) / TILE_WIDTH;  // use actual M, not bank-padded M_padded
     uint32_t* ybits = reinterpret_cast<uint32_t*>(out);
     for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
         uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
@@ -960,14 +960,52 @@ static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
                                                             uint32_t M, uint32_t K) {
     constexpr uint32_t TH = TILE_HEIGHT, TW = TILE_WIDTH;
     uint32_t Mt = M / TH, Kt = K / TW;
-    uint32_t num_tiles = Mt * Kt;
     constexpr uint32_t bfp8_tile_bytes = BFLOAT8_B_TILE_HW;  // 1088
 
-    DeviceLocalBufferConfig dram_cfg{.page_size = bfp8_tile_bytes, .buffer_type = BufferType::DRAM};
-    auto buf = MeshBuffer::create(ReplicatedBufferConfig{.size = num_tiles * bfp8_tile_bytes},
-                                   dram_cfg, device);
+    // Create DRAM-sharded buffer: each bank stores Mt_per_bank * Kt contiguous tiles
+    uint32_t num_banks = g_num_dram_banks;
+    uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+    uint32_t Mt_padded = Mt_per_bank * num_banks;
+    uint32_t total_pages = Mt_padded * Kt;
+    uint32_t pages_per_bank = Mt_per_bank * Kt;
+    uint32_t total_bytes = total_pages * bfp8_tile_bytes;
+
+    // Pad packed data with zero tiles if Mt not divisible by num_banks
+    std::vector<uint32_t> padded_packed;
+    uint32_t words_per_tile = bfp8_tile_bytes / sizeof(uint32_t);  // 272
+    uint32_t needed_words = total_pages * words_per_tile;
+    if (packed.size() < needed_words) {
+        padded_packed = packed;
+        padded_packed.resize(needed_words, 0);
+    }
+    const auto& write_data = (packed.size() >= needed_words) ? packed : padded_packed;
+
+    // DRAM bank core coordinates: 1D range (x=bank_id, y=0)
+    CoreRange dram_bank_range({0, 0}, {num_banks - 1, 0});
+    auto dram_cores = corerange_to_cores(CoreRangeSet(dram_bank_range));
+
+    BufferDistributionSpec shard_spec(
+        tt::tt_metal::Shape({1, total_pages}),
+        tt::tt_metal::Shape({1, pages_per_bank}),
+        dram_cores);
+
+    DeviceLocalBufferConfig dram_cfg{
+        .page_size = bfp8_tile_bytes,
+        .buffer_type = BufferType::DRAM,
+        .sharding_args = BufferShardingArgs(shard_spec)};
+
+    // Use {1, total_pages} shape so bytes_per_datum = 1088 exactly (avoids BFP8_B rounding)
+    Shape2D global_shape = {1, total_pages};
+    distributed::ShardedBufferConfig sharded_cfg{
+        .global_size = total_bytes,
+        .global_buffer_shape = global_shape,
+        .shard_shape = global_shape,
+        .shard_orientation = ShardOrientation::ROW_MAJOR,
+    };
+
+    auto buf = MeshBuffer::create(sharded_cfg, dram_cfg, device);
     auto& cq = device->mesh_command_queue();
-    EnqueueWriteMeshBuffer(cq, buf, packed, false);
+    EnqueueWriteMeshBuffer(cq, buf, write_data, false);
     return buf;
 }
 
@@ -1673,6 +1711,14 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     auto grid = g_mesh->compute_with_storage_grid_size();
     printf("Chip 0 opened: compute grid %zux%zu (%zu cores)\n",
            grid.x, grid.y, grid.x * grid.y);
+
+    // Query DRAM bank topology for sharded GEMV
+    g_num_dram_banks = g_mesh->num_dram_channels();
+    g_dram_workers = g_mesh->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_0);
+    printf("DRAM banks: %u, optimal workers:\n", g_num_dram_banks);
+    for (uint32_t b = 0; b < g_num_dram_banks; b++) {
+        printf("  bank %u -> core (%zu, %zu)\n", b, g_dram_workers[b].x, g_dram_workers[b].y);
+    }
 
     // Enable program cache for faster repeated matmul dispatch
     g_mesh->enable_program_cache();
