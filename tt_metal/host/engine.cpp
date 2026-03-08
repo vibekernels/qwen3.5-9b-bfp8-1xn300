@@ -456,9 +456,10 @@ static void dispatch_gemv(MeshDevice* device,
                 .set_page_size(CBIndex::c_0, bf16_tile_bytes);
         CreateCircularBuffer(program, core_range, cb_act_cfg);
 
-        // Weight CB: 2 tiles for double-buffering
+        // Weight CB: 8 tiles for batched NOC reads + compute overlap
+        constexpr uint32_t WEIGHT_CB_TILES = 8;
         CircularBufferConfig cb_weight_cfg =
-            CircularBufferConfig(2 * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+            CircularBufferConfig(WEIGHT_CB_TILES * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
                 .set_page_size(CBIndex::c_1, weight_tile_bytes);
         CreateCircularBuffer(program, core_range, cb_weight_cfg);
 
