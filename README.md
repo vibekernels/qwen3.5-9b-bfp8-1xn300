@@ -1,30 +1,53 @@
 # qwen3.5-9b-bf16-1xn300d
 
-Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with hand-written tt-metal kernels (no frameworks).
+Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metal/ttnn APIs.
 
 ## Architecture
 
 Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (every 4th) and 24 SSM delta-net recurrent layers.
 
 - **Matrix multiplications** run on-device via `ttnn::matmul` on Tensix cores
-- **Chip 0** holds layer weights (attention QKV, SSM combined, FFN gate/up/down projections)
-- **Chip 1** holds output projections (attention Wo, SSM out, LM head)
-- **Small element-wise ops** (RoPE, attention scores, SSM recurrence, gating, RMSNorm) run on host CPU in f32
-- **Weights** stored on device DRAM as tiled BF16 MeshBuffers (~12 GB total)
+- **Chip 0** holds all layer weights + output projections as BFLOAT8_B (~6.75 GB)
+- **Chip 1** holds the LM head as BFLOAT8_B (~1 GB)
+- **On-device RMSNorm** via `ttnn::rms_norm` (eliminates PCIe round-trip for norm)
+- **On-device FFN chain**: output projection + residual add + norm + gate/up/down matmuls + residual add, all as a single traced operation
+- **SSM recurrence** and **attention** (softmax + KV cache) run on host CPU in f32
+- **Metal Traces** capture and replay device op sequences with zero dispatch overhead
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~280 ms/tok |
-| Decode throughput | ~3.6 tok/s |
-| Model size | ~18 GB BF16 |
+| Decode latency | ~115-130 ms/tok |
+| Decode throughput | ~8-9 tok/s |
+| Model size (device) | ~7.75 GB BFLOAT8_B |
+| Theoretical floor | ~88 ms/tok (DRAM bandwidth limited) |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first run in a fresh build directory is slower (~500ms/tok) while tt-metal compiles and caches device kernels in `generated/`; subsequent runs stabilize at ~280ms/tok.
+Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first token is slower (~160ms) while traces are captured; subsequent tokens stabilize at ~115-130ms.
+
+### Decode time breakdown (steady state, token 90+)
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| norm + matmul traces | 84 ms | Includes waiting for previous FFN chain; DRAM bandwidth limited |
+| Host SSM/attention | 15-18 ms | Delta-net recurrence (12ms) + conv1d (1.3ms) + attention (2-3ms) |
+| LM head (chip 1) | 15 ms | 248K x 4096 BFP8 matmul, bandwidth limited |
+| Residual writes | 13 ms | 32 PCIe writes per token (tilize + enqueue) |
+| FFN chain dispatch | ~0 ms | Non-blocking, overlaps with next layer's norm wait |
+
+### Why 30 tok/s is not achievable
+
+The fundamental bottleneck is DRAM bandwidth:
+- **6.75 GB** of BFP8 weights must be read per token
+- At ~115 GB/s effective DRAM bandwidth: **59 ms minimum** just for weight reads
+- Plus PCIe overhead (13ms), LM head (15ms), host compute (15ms)
+- **Theoretical floor: ~88 ms/tok = 11.4 tok/s**
+
+For reference, Qwen 2.5 7B (smaller, pure attention) achieves ~22 tok/s on N300.
 
 ## Building
 
-Requires tt-metal built from source (with `_ttnncpp.so`) and clang-20 (must match tt-metal's compiler).
+Requires tt-metal built from source (with `_ttnncpp.so`) and clang-20.
 
 ```sh
 cd tt_metal
@@ -69,8 +92,8 @@ tt_metal/
     gguf_loader.h             # loader interface
     model_config.h            # Qwen3.5-9B hyperparameters and tile dimensions
   kernels/
-    compute/                  # Tensix compute kernels (unused — matmuls via ttnn)
-    dataflow/                 # data movement kernels (unused — using ttnn API)
+    compute/                  # Tensix compute kernels (unused -- matmuls via ttnn)
+    dataflow/                 # data movement kernels (unused -- using ttnn API)
   tests/
     test_device.cpp           # device validation
     test_matmul.cpp           # basic matmul test
@@ -83,10 +106,14 @@ src/
 
 ## Key optimizations
 
-- **Pre-allocated device buffers** for zero-allocation GEMV dispatch (no per-call MeshBuffer create/destroy)
-- **Two-chip parallelism**: layer weights on chip 0, output projections on chip 1
+- **BFLOAT8_B weights** on device (halves DRAM reads vs BF16, native HW decompression)
+- **Metal Traces** for norm+matmul and FFN chain ops (zero dispatch overhead on replay)
+- **On-device RMSNorm + FFN chain**: outproj + residual add + norm + gate(SiLU)/up/down matmuls + residual add, all in one traced sequence per layer
+- **Two-chip split**: chip 0 for 32 layer weights, chip 1 for LM head (avoids DRAM contention)
+- **Pre-allocated device buffers** for zero-allocation GEMV dispatch
+- **Fast approximate exp()** (Schraudolph's method) for SiLU/sigmoid in conv1d and gated norm
+- **Vectorized conv1d**: separated convolution from state update for auto-vectorization
 - **Pre-computed RoPE tables** (avoids trig calls per token)
 - **Raw bf16 bit operations** for f32<->bf16 conversion (avoids bfloat16 class overhead)
 - **Static scratch buffers** for all forward pass intermediates (no heap allocation per token)
-- **Transposed SSM state layout** `[head_v, head_k]` for contiguous inner-loop access
 - **Program cache enabled** for faster repeated matmul dispatch
