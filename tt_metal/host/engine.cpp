@@ -81,31 +81,43 @@ static std::vector<float> g_conv_state[24];
 // Cached weight Tensors (wrapping on-device MeshBuffers for ttnn::matmul)
 // ============================================================================
 struct WeightTensors {
-    // Chip 0: Attention layers (8)
-    Tensor attn_wqkv[8];
-    Tensor attn_ffn_gate[8];     // [n_ff, n_embd] with fused SiLU
-    Tensor attn_ffn_up[8];       // [n_ff, n_embd]
-    Tensor attn_ffn_down[8];
+    // Chip 0: Attention layers (8) — MeshBuffers for custom kernel dispatch
+    std::shared_ptr<MeshBuffer> attn_wqkv_buf[8];
+    std::shared_ptr<MeshBuffer> attn_ffn_gate_buf[8];
+    std::shared_ptr<MeshBuffer> attn_ffn_up_buf[8];
+    std::shared_ptr<MeshBuffer> attn_ffn_down_buf[8];
+    std::shared_ptr<MeshBuffer> attn_wo_buf[8];
 
-    // Chip 0: SSM layers (24)
-    Tensor ssm_w_combined[24];
-    Tensor ssm_ffn_gate[24];     // [n_ff, n_embd] with fused SiLU
-    Tensor ssm_ffn_up[24];       // [n_ff, n_embd]
-    Tensor ssm_ffn_down[24];
+    // Chip 0: SSM layers (24) — MeshBuffers for custom kernel dispatch
+    std::shared_ptr<MeshBuffer> ssm_w_combined_buf[24];
+    std::shared_ptr<MeshBuffer> ssm_ffn_gate_buf[24];
+    std::shared_ptr<MeshBuffer> ssm_ffn_up_buf[24];
+    std::shared_ptr<MeshBuffer> ssm_ffn_down_buf[24];
+    std::shared_ptr<MeshBuffer> ssm_out_buf[24];
 
-    // Output projections (chip 0, BFP8) + LM head (chip 1, BFP8)
-    Tensor attn_wo[8];           // [n_embd, n_head*head_dim] on chip 0
-    Tensor ssm_out[24];          // [n_embd, ssm_d_inner] on chip 0
-    Tensor lm_head;              // [n_vocab, n_embd] on chip 1
+    // LM head
+    std::shared_ptr<MeshBuffer> lm_head_buf;
 
-    // Norm weights as device tensors (for on-device RMSNorm)
-    Tensor attn_norm[32];        // pre-attention norm for each layer
-    Tensor post_norm[32];        // post-attention norm for each layer
-    Tensor output_norm_tensor;   // final output norm
-
-    // Raw norm weight buffers (for custom dispatch_rmsnorm)
+    // Norm weight buffers (BF16 on device, for custom dispatch_rmsnorm)
     std::shared_ptr<MeshBuffer> attn_norm_buf[32];
     std::shared_ptr<MeshBuffer> post_norm_buf[32];
+    std::shared_ptr<MeshBuffer> output_norm_buf;
+
+    // Keep Tensor wrappers temporarily for compatibility during transition
+    Tensor attn_wqkv[8];
+    Tensor attn_ffn_gate[8];
+    Tensor attn_ffn_up[8];
+    Tensor attn_ffn_down[8];
+    Tensor ssm_w_combined[24];
+    Tensor ssm_ffn_gate[24];
+    Tensor ssm_ffn_up[24];
+    Tensor ssm_ffn_down[24];
+    Tensor attn_wo[8];
+    Tensor ssm_out[24];
+    Tensor lm_head;
+    Tensor attn_norm[32];
+    Tensor post_norm[32];
+    Tensor output_norm_tensor;
 };
 static WeightTensors g_wt;
 
@@ -186,7 +198,7 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
                             out_spec, TensorTopology{});
 
     auto [ins, _] = g_gemv_bufs.emplace(key, std::move(buf));
-    printf("  [gemv_buf] allocated K=%u M=%u on device\n", K, M);
+    printf("  [gemv_buf] allocated K=%u M=%u on device\n", K, M); fflush(stdout);
     return ins->second;
 }
 
@@ -395,11 +407,12 @@ struct CachedGemvWorkload {
 };
 static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedGemvWorkload> g_gemv_cache;
 
-// Dispatch custom GEMV: y[1,M] = x[1,K] @ W[M,K]^T
+// Multi-core GEMV: y[1,M] = x[1,K] @ W[M,K]^T
+// Distributes Mt output tile-rows across all available Tensix cores.
+// Each core reads all Kt activation tiles + its slice of weight tiles.
 // act_buf: [1, K_padded] BF16 activation on device
-// weight_buf: [M_padded, K_padded] BFP8_B weight on device (will be transposed)
+// weight_buf: [M_padded, K_padded] BFP8_B weight on device
 // out_buf: [1, M_padded] BF16 output on device
-// MeshWorkload is cached and reused — trace-compatible after first warmup call.
 static void dispatch_gemv(MeshDevice* device,
                            std::shared_ptr<MeshBuffer> act_buf,
                            std::shared_ptr<MeshBuffer> weight_buf,
@@ -417,56 +430,185 @@ static void dispatch_gemv(MeshDevice* device,
         uint32_t Kt = K / TILE_WIDTH;
         uint32_t Mt = M / TILE_HEIGHT;
 
+        // Use all available cores
+        auto grid = device->compute_with_storage_grid_size();
+        uint32_t max_cores = grid.x * grid.y;  // 56 on Wormhole
+        uint32_t num_cores = std::min(max_cores, Mt);  // Don't use more cores than tiles
+        if (num_cores == 0) num_cores = 1;
+
+        // Compute tiles per core (some cores get +1 for remainder)
+        uint32_t base_per_core = Mt / num_cores;
+        uint32_t remainder = Mt % num_cores;
+
+        // Create core range spanning num_cores (row-major in grid)
+        uint32_t end_x = (num_cores <= grid.x) ? num_cores - 1 : grid.x - 1;
+        uint32_t end_y = (num_cores <= grid.x) ? 0 : (num_cores - 1) / grid.x;
+        CoreRange core_range({0, 0}, {end_x, end_y});
+
         Program program = CreateProgram();
-        tt::tt_metal::CoreCoord core = {0, 0};
 
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
+        // Activation CB: Kt tiles (loaded once, reused for all output rows)
         CircularBufferConfig cb_act_cfg =
-            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_0, bf16_tile_bytes);
-        CreateCircularBuffer(program, core, cb_act_cfg);
+        CreateCircularBuffer(program, core_range, cb_act_cfg);
 
+        // Weight CB: 2 tiles for double-buffering
         CircularBufferConfig cb_weight_cfg =
             CircularBufferConfig(2 * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
                 .set_page_size(CBIndex::c_1, weight_tile_bytes);
-        CreateCircularBuffer(program, core, cb_weight_cfg);
+        CreateCircularBuffer(program, core_range, cb_weight_cfg);
 
+        // Output CB: 2 tiles
         CircularBufferConfig cb_out_cfg =
             CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_16, bf16_tile_bytes);
-        CreateCircularBuffer(program, core, cb_out_cfg);
+        CreateCircularBuffer(program, core_range, cb_out_cfg);
 
+        // Reader kernel (multi-core): reads all act tiles + weight slice
         std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt};
         TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
         TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
 
         auto reader_kid = CreateKernel(program,
-            kernel_path("dataflow/reader_gemv.cpp"), core,
+            kernel_path("dataflow/reader_gemv_multicore.cpp"), core_range,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute kernel: Kt is compile-time, Mt_per_core is runtime
+        std::vector<uint32_t> compute_ct_args = {Kt};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), core_range,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        // Writer kernel (multi-core): writes output slice
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_multicore.cpp"), core_range,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        // Set per-core runtime args
+        uint32_t tile_offset = 0;
+        for (uint32_t c = 0; c < num_cores; c++) {
+            uint32_t core_x = c % grid.x;
+            uint32_t core_y = c / grid.x;
+            CoreCoord core_coord(core_x, core_y);
+
+            uint32_t mt_this_core = base_per_core + (c < remainder ? 1 : 0);
+
+            // Reader: [act_addr, weight_addr, Mt_per_core, weight_start_tile]
+            SetRuntimeArgs(program, reader_kid, core_coord,
+                           {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
+                            mt_this_core, tile_offset});
+
+            // Compute: [Mt_per_core]
+            SetRuntimeArgs(program, compute_kid, core_coord,
+                           {mt_this_core});
+
+            // Writer: [dst_addr, Mt_per_core, out_start_tile]
+            SetRuntimeArgs(program, writer_kid, core_coord,
+                           {(uint32_t)out_buf->address(), mt_this_core, tile_offset});
+
+            tile_offset += mt_this_core;
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached SwiGLU workload: SiLU(gate) * up
+struct CachedSwigluWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedSwigluWorkload> g_swiglu_cache;
+
+// Dispatch SwiGLU: out = SiLU(gate) * up
+// gate_buf, up_buf: [1, N_padded] BF16 on device
+// out_buf: [1, N_padded] BF16 on device
+static void dispatch_swiglu(MeshDevice* device,
+                             std::shared_ptr<MeshBuffer> gate_buf,
+                             std::shared_ptr<MeshBuffer> up_buf,
+                             std::shared_ptr<MeshBuffer> out_buf,
+                             uint32_t n_tiles) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)gate_buf->address(),
+                               (uint32_t)up_buf->address(), (uint32_t)out_buf->address());
+    auto& cached = g_swiglu_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+        Program program = CreateProgram();
+        tt::tt_metal::CoreCoord core = {0, 0};
+
+        uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+        // gate CB (c_0), up CB (c_1), intermediate SiLU CB (c_2), output CB (c_16)
+        CircularBufferConfig cb_gate_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, tile_bytes);
+        CreateCircularBuffer(program, core, cb_gate_cfg);
+
+        CircularBufferConfig cb_up_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_1, tile_bytes);
+        CreateCircularBuffer(program, core, cb_up_cfg);
+
+        CircularBufferConfig cb_silu_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, tile_bytes);
+        CreateCircularBuffer(program, core, cb_silu_cfg);
+
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, tile_bytes);
+        CreateCircularBuffer(program, core, cb_out_cfg);
+
+        // Reader: reads gate and up tiles into c_0 and c_1
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1};
+        TensorAccessorArgs(*gate_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*up_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_binary_tiles.cpp"), core,
             DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                                .noc = NOC::RISCV_1_default,
                                .compile_args = reader_ct_args});
 
         SetRuntimeArgs(program, reader_kid, core,
-                       {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(), Mt});
+                       {(uint32_t)gate_buf->address(), (uint32_t)up_buf->address(), n_tiles});
 
-        std::vector<uint32_t> compute_ct_args = {Mt, Kt};
+        // Compute: SwiGLU (SiLU(gate) * up)
+        std::vector<uint32_t> compute_ct_args = {n_tiles};
         CreateKernel(program,
-            kernel_path("compute/gemv.cpp"), core,
+            kernel_path("compute/swiglu.cpp"), core,
             ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
 
+        // Writer: writes result from c_16
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
         TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
 
         auto writer_kid = CreateKernel(program,
-            kernel_path("dataflow/writer_gemv.cpp"), core,
+            kernel_path("dataflow/writer_tiles.cpp"), core,
             DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                .noc = NOC::RISCV_0_default,
                                .compile_args = writer_ct_args});
 
         SetRuntimeArgs(program, writer_kid, core,
-                       {(uint32_t)out_buf->address(), Mt});
+                       {(uint32_t)out_buf->address(), n_tiles});
 
         cached.workload = MeshWorkload();
         cached.workload.add_program(dev_range, std::move(program));
@@ -594,77 +736,72 @@ static bool g_norm_matmul_traces_valid[32] = {};
 static MeshTraceId g_ffn_chain_traces[32];
 static bool g_ffn_chain_traces_valid[32] = {};
 
-// Run norm + matmul on device (g_hidden_dev → norm → matmul → gemv out buffer)
-static void norm_matmul_ops(const Tensor& norm_weight, const Tensor& weight,
+// Run norm + matmul on device using custom kernels (no ttnn dependency)
+// g_hidden_dev_buf → dispatch_rmsnorm → g_norm_dev_buf → dispatch_gemv → out_buf
+static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
+                            std::shared_ptr<MeshBuffer> weight_buf,
                             uint32_t M, uint32_t K) {
-    auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, norm_weight);
+    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
+    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                     g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), M, K);
-    ttnn::matmul(norm_out, weight,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, gb.out_tensor);
+    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
 }
 
-// Run output norm + LM head matmul on device (fused, no host round-trip)
+// Run output norm + LM head matmul on device (custom kernels, no host round-trip)
+static std::shared_ptr<MeshBuffer> g_output_norm_buf;
+static std::shared_ptr<MeshBuffer> g_lm_head_buf;
 static void norm_lmhead_ops() {
-    auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, g_wt.output_norm_tensor);
+    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
+    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_output_norm_buf,
+                     g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
-    ttnn::matmul(norm_out, g_wt.lm_head,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, gb.out_tensor);
+    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb.out_buf, MC::n_vocab, MC::n_embd);
 }
 static MeshTraceId g_lmhead_trace;
 static bool g_lmhead_trace_valid = false;
 
 // Run outproj matmul + residual add + norm + FFN chain + residual add on device.
-// Input: g_residual_dev contains ssm_proj_in or attn_out (written by host).
-// Output: g_hidden_dev updated with outproj residual + FFN residual.
-static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj_M, uint32_t outproj_K,
-                                   const Tensor& norm_weight,
-                                   const Tensor& gate_weight, const Tensor& up_weight,
-                                   const Tensor& down_weight) {
+// All using custom kernels (dispatch_gemv, dispatch_rmsnorm, dispatch_swiglu, dispatch_eltwise).
+static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf,
+                                   uint32_t outproj_M, uint32_t outproj_K,
+                                   std::shared_ptr<MeshBuffer> norm_weight_buf,
+                                   std::shared_ptr<MeshBuffer> gate_weight_buf,
+                                   std::shared_ptr<MeshBuffer> up_weight_buf,
+                                   std::shared_ptr<MeshBuffer> down_weight_buf) {
     // 1. Output projection: matmul(residual, outproj_weight)
     auto& gb_op = get_gemv_buf(g_mesh.get(), outproj_M, outproj_K);
-    ttnn::matmul(g_residual_dev, outproj_weight,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, gb_op.out_tensor);
+    dispatch_gemv(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf, gb_op.out_buf,
+                  outproj_M, outproj_K);
 
     // 2. Residual add: hidden += outproj result (custom kernel)
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
     dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_op.out_buf,
                             g_hidden_dev_buf, embd_tiles);
 
-    // 3. RMSNorm (ttnn multi-core for perf)
-    auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, norm_weight);
+    // 3. RMSNorm (custom single-core kernel)
+    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                     g_norm_dev_buf, MC::n_embd, embd_tiles);
 
-    // 4. FFN: gate matmul (fused SiLU) + up matmul + multiply + down matmul
+    // 4. FFN: gate + up matmuls → SwiGLU (SiLU(gate)*up) → down matmul
     auto& fb = get_ffn_buf(g_mesh.get());
     auto& gb_dn = get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);
 
-    // Gate with fused SiLU activation (eliminates separate slice + silu ops)
-    ttnn::matmul(norm_out, gate_weight,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::string("silu"), std::nullopt,
-                 std::nullopt, std::nullopt, fb.gate_tensor);
+    // Gate projection (no fused activation)
+    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, gate_weight_buf, fb.gate_buf,
+                  MC::n_ff, MC::n_embd);
 
-    // Up projection (no activation)
-    ttnn::matmul(norm_out, up_weight,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, fb.up_tensor);
+    // Up projection
+    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, up_weight_buf, fb.up_buf,
+                  MC::n_ff, MC::n_embd);
 
-    // Gate * Up (custom kernel)
+    // SwiGLU: SiLU(gate) * up
     constexpr uint32_t ff_tiles = MC::n_ff / TILE_WIDTH;
-    dispatch_eltwise_binary(g_mesh.get(), 1 /*mul*/, fb.gate_buf, fb.up_buf,
-                            fb.act_buf, ff_tiles);
+    dispatch_swiglu(g_mesh.get(), fb.gate_buf, fb.up_buf, fb.act_buf, ff_tiles);
 
     // Down projection
-    ttnn::matmul(fb.act_tensor, down_weight,
-                 false, true, ttnn::DRAM_MEMORY_CONFIG,
-                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, gb_dn.out_tensor);
+    dispatch_gemv(g_mesh.get(), fb.act_buf, down_weight_buf, gb_dn.out_buf,
+                  MC::n_embd, MC::n_ff);
 
     // 5. Residual add: hidden += ffn_out (custom kernel)
     dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_dn.out_buf,
@@ -816,8 +953,10 @@ static std::vector<uint32_t> pack_bf16_as_bfp8b(const uint16_t* bf16_data, uint3
 }
 
 // Upload pre-packed BFP8_B tiles to device and wrap as Tensor
-static Tensor upload_packed_bfp8b(MeshDevice* device, const std::vector<uint32_t>& packed,
-                                   uint32_t M, uint32_t K) {
+// Upload packed BFP8_B data to device, return MeshBuffer directly
+static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
+                                                            const std::vector<uint32_t>& packed,
+                                                            uint32_t M, uint32_t K) {
     constexpr uint32_t TH = TILE_HEIGHT, TW = TILE_WIDTH;
     uint32_t Mt = M / TH, Kt = K / TW;
     uint32_t num_tiles = Mt * Kt;
@@ -828,7 +967,12 @@ static Tensor upload_packed_bfp8b(MeshDevice* device, const std::vector<uint32_t
                                    dram_cfg, device);
     auto& cq = device->mesh_command_queue();
     EnqueueWriteMeshBuffer(cq, buf, packed, false);
+    return buf;
+}
 
+static Tensor upload_packed_bfp8b(MeshDevice* device, const std::vector<uint32_t>& packed,
+                                   uint32_t M, uint32_t K) {
+    auto buf = upload_packed_bfp8b_buf(device, packed, M, K);
     TensorSpec spec(
         Shape({1, 1, M, K}),
         TensorLayout(DataType::BFLOAT8_B, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
@@ -874,11 +1018,11 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ssm_out_host); }
 
             // Upload packed data sequentially (device I/O)
-            g_wt.ssm_w_combined[ssm_idx] = upload_packed_bfp8b(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
-            g_wt.ssm_ffn_gate[ssm_idx] = upload_packed_bfp8b(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
-            g_wt.ssm_ffn_up[ssm_idx] = upload_packed_bfp8b(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
-            g_wt.ssm_ffn_down[ssm_idx] = upload_packed_bfp8b(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
-            g_wt.ssm_out[ssm_idx] = upload_packed_bfp8b(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
+            g_wt.ssm_w_combined_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
+            g_wt.ssm_ffn_gate_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
+            g_wt.ssm_ffn_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
+            g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
+            g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
 
             if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d uploaded\n", ssm_idx);
             ssm_idx++;
@@ -907,11 +1051,11 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.wo_host); }
 
             // Upload packed data sequentially
-            g_wt.attn_wqkv[attn_idx] = upload_packed_bfp8b(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
-            g_wt.attn_ffn_gate[attn_idx] = upload_packed_bfp8b(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
-            g_wt.attn_ffn_up[attn_idx] = upload_packed_bfp8b(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
-            g_wt.attn_ffn_down[attn_idx] = upload_packed_bfp8b(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
-            g_wt.attn_wo[attn_idx] = upload_packed_bfp8b(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
+            g_wt.attn_wqkv_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
+            g_wt.attn_ffn_gate_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
+            g_wt.attn_ffn_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
+            g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
+            g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
 
             printf("  Attn layer %d uploaded\n", attn_idx);
             attn_idx++;
@@ -926,7 +1070,8 @@ static void create_weight_tensors() {
     // LM head on chip 0 (fused with output norm in traced chain)
     auto p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
     { std::vector<uint16_t>().swap(g_model.output_host); }
-    g_wt.lm_head = upload_packed_bfp8b(g_mesh.get(), p_lm, MC::n_vocab, MC::n_embd);
+    g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), p_lm, MC::n_vocab, MC::n_embd);
+    g_lm_head_buf = g_wt.lm_head_buf;
     printf("  lm_head uploaded\n");
 
     // Wrap norm weights as device Tensors for on-device RMSNorm
@@ -958,7 +1103,8 @@ static void create_weight_tensors() {
             attn_idx++;
         }
     }
-    g_wt.output_norm_tensor = wrap_1d(g_model.output_norm, MC::n_embd);
+    g_wt.output_norm_buf = g_model.output_norm;
+    g_output_norm_buf = g_model.output_norm;
 
     // Create persistent hidden state + residual + norm output buffers on chip 0
     printf("Creating persistent device buffers...\n");
@@ -983,6 +1129,20 @@ static void create_weight_tensors() {
                              embd_spec, TensorTopology{});
     g_norm_dev = Tensor(DeviceStorage(g_norm_dev_buf, {MeshCoordinate(0, 0)}),
                          embd_spec, TensorTopology{});
+    // Pre-allocate all GEMV and FFN intermediate buffers (required before trace capture)
+    printf("Pre-allocating GEMV and FFN buffers...\n");
+    constexpr int combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
+                                + MC::ssm_dt_rank + MC::ssm_dt_rank;
+    constexpr int qkv_rows = MC::n_head * MC::head_dim * 2 + 2 * MC::n_head_kv * MC::head_dim;
+    get_gemv_buf(g_mesh.get(), combined_rows, MC::n_embd);  // SSM combined
+    get_gemv_buf(g_mesh.get(), qkv_rows, MC::n_embd);       // Attention QKV
+    get_gemv_buf(g_mesh.get(), MC::n_embd, MC::ssm_d_inner); // SSM outproj
+    get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_embd);      // Attn outproj (same as ssm outproj if sizes match)
+    get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_head * MC::head_dim); // Attn outproj
+    get_gemv_buf(g_mesh.get(), MC::n_ff, MC::n_embd);        // Gate/up projections
+    get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);        // Down projection
+    get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);     // LM head
+    get_ffn_buf(g_mesh.get());                                // FFN intermediates
     printf("Persistent device buffers created.\n");
 }
 
@@ -1143,12 +1303,12 @@ static float* forward_decode() {
 
             if (!g_norm_matmul_traces_valid[layer]) {
                 // Warmup
-                norm_matmul_ops(g_wt.attn_norm[layer], g_wt.ssm_w_combined[ssm_idx],
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
                                g_combined_rows, MC::n_embd);
                 EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
                 // Capture trace
                 auto tid = g_mesh->begin_mesh_trace(0);
-                norm_matmul_ops(g_wt.attn_norm[layer], g_wt.ssm_w_combined[ssm_idx],
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
                                g_combined_rows, MC::n_embd);
                 g_mesh->end_mesh_trace(0, tid);
                 g_norm_matmul_traces[layer] = tid;
@@ -1302,16 +1462,16 @@ static float* forward_decode() {
 
             auto t2 = Clock::now();
             if (!g_ffn_chain_traces_valid[layer]) {
-                outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                                      g_wt.post_norm[layer],
-                                      g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
-                                      g_wt.ssm_ffn_down[ssm_idx]);
+                outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                      g_wt.post_norm_buf[layer],
+                                      g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                      g_wt.ssm_ffn_down_buf[ssm_idx]);
                 Finish(cq0);
                 auto tid = g_mesh->begin_mesh_trace(0);
-                outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                                      g_wt.post_norm[layer],
-                                      g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
-                                      g_wt.ssm_ffn_down[ssm_idx]);
+                outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                      g_wt.post_norm_buf[layer],
+                                      g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                      g_wt.ssm_ffn_down_buf[ssm_idx]);
                 g_mesh->end_mesh_trace(0, tid);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1332,11 +1492,11 @@ static float* forward_decode() {
             auto t0 = Clock::now();
 
             if (!g_norm_matmul_traces_valid[layer]) {
-                norm_matmul_ops(g_wt.attn_norm[layer], g_wt.attn_wqkv[attn_idx],
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
                                g_qkv_rows, MC::n_embd);
                 EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
                 auto tid = g_mesh->begin_mesh_trace(0);
-                norm_matmul_ops(g_wt.attn_norm[layer], g_wt.attn_wqkv[attn_idx],
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
                                g_qkv_rows, MC::n_embd);
                 g_mesh->end_mesh_trace(0, tid);
                 g_norm_matmul_traces[layer] = tid;
@@ -1438,16 +1598,16 @@ static float* forward_decode() {
 
             auto t2 = Clock::now();
             if (!g_ffn_chain_traces_valid[layer]) {
-                outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                                      g_wt.post_norm[layer],
-                                      g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
-                                      g_wt.attn_ffn_down[attn_idx]);
+                outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                      g_wt.post_norm_buf[layer],
+                                      g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                      g_wt.attn_ffn_down_buf[attn_idx]);
                 Finish(cq0);
                 auto tid = g_mesh->begin_mesh_trace(0);
-                outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                                      g_wt.post_norm[layer],
-                                      g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
-                                      g_wt.attn_ffn_down[attn_idx]);
+                outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                      g_wt.post_norm_buf[layer],
+                                      g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                      g_wt.attn_ffn_down_buf[attn_idx]);
                 g_mesh->end_mesh_trace(0, tid);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1465,10 +1625,8 @@ static float* forward_decode() {
     auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
 
     if (!g_lmhead_trace_valid) {
-        // Warmup
         norm_lmhead_ops();
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
-        // Capture trace
         auto tid = g_mesh->begin_mesh_trace(0);
         norm_lmhead_ops();
         g_mesh->end_mesh_trace(0, tid);
@@ -1664,28 +1822,17 @@ void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
 
-    // Release norm+matmul traces (chip 0)
+    // Release traces
     for (int i = 0; i < 32; i++) {
         if (g_norm_matmul_traces_valid[i]) {
             g_mesh->release_mesh_trace(g_norm_matmul_traces[i]);
             g_norm_matmul_traces_valid[i] = false;
         }
-    }
-    // Release FFN chain traces (chip 0)
-    for (int i = 0; i < 32; i++) {
         if (g_ffn_chain_traces_valid[i]) {
             g_mesh->release_mesh_trace(g_ffn_chain_traces[i]);
             g_ffn_chain_traces_valid[i] = false;
         }
     }
-    // Release gemv traces (all on chip 0)
-    for (int i = 0; i < 128; i++) {
-        if (g_gemv_traces[i].valid) {
-            g_mesh->release_mesh_trace(g_gemv_traces[i].trace_id);
-            g_gemv_traces[i].valid = false;
-        }
-    }
-    // Release fused norm+LM head trace
     if (g_lmhead_trace_valid) {
         g_mesh->release_mesh_trace(g_lmhead_trace);
         g_lmhead_trace_valid = false;
@@ -1695,24 +1842,29 @@ void shutdown() {
     g_eltwise_cache.clear();
     g_gemv_cache.clear();
     g_rmsnorm_cache.clear();
+    g_swiglu_cache.clear();
 
     // Clear pre-allocated GEMV and FFN buffers
     g_ffn_bufs.clear();
     g_gemv_bufs.clear();
 
-    // Clear weight tensor wrappers — chip 0
-    for (auto& t : g_wt.attn_wqkv) t = Tensor();
-    for (auto& t : g_wt.attn_ffn_gate) t = Tensor();
-    for (auto& t : g_wt.attn_ffn_up) t = Tensor();
-    for (auto& t : g_wt.attn_ffn_down) t = Tensor();
-    for (auto& t : g_wt.ssm_w_combined) t = Tensor();
-    for (auto& t : g_wt.ssm_ffn_gate) t = Tensor();
-    for (auto& t : g_wt.ssm_ffn_up) t = Tensor();
-    for (auto& t : g_wt.ssm_ffn_down) t = Tensor();
-    for (auto& t : g_wt.attn_wo) t = Tensor();
-    for (auto& t : g_wt.ssm_out) t = Tensor();
-    g_wt.lm_head = Tensor();
-    g_wt.output_norm_tensor = Tensor();
+    // Clear weight MeshBuffers
+    for (auto& b : g_wt.attn_wqkv_buf) b.reset();
+    for (auto& b : g_wt.attn_ffn_gate_buf) b.reset();
+    for (auto& b : g_wt.attn_ffn_up_buf) b.reset();
+    for (auto& b : g_wt.attn_ffn_down_buf) b.reset();
+    for (auto& b : g_wt.attn_wo_buf) b.reset();
+    for (auto& b : g_wt.ssm_w_combined_buf) b.reset();
+    for (auto& b : g_wt.ssm_ffn_gate_buf) b.reset();
+    for (auto& b : g_wt.ssm_ffn_up_buf) b.reset();
+    for (auto& b : g_wt.ssm_ffn_down_buf) b.reset();
+    for (auto& b : g_wt.ssm_out_buf) b.reset();
+    g_wt.lm_head_buf.reset();
+    g_wt.output_norm_buf.reset();
+    g_lm_head_buf.reset();
+    g_output_norm_buf.reset();
+    for (auto& b : g_wt.attn_norm_buf) b.reset();
+    for (auto& b : g_wt.post_norm_buf) b.reset();
 
     g_model.output_norm.reset();
     for (auto& l : g_model.attn_layers) {
