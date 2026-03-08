@@ -61,3 +61,7 @@ target_include_directories(test_bandwidth PRIVATE ${TT_METAL_BUILD}/include)
 # Mesh overhead benchmark
 add_executable(test_mesh_overhead tests/test_mesh_overhead.cpp)
 target_link_libraries(test_mesh_overhead PRIVATE TT::Metalium)
+
+# DRAM bandwidth benchmark (on-device kernel reader)
+add_executable(test_dram_bw tests/test_dram_bw.cpp)
+target_link_libraries(test_dram_bw PRIVATE TT::Metalium)

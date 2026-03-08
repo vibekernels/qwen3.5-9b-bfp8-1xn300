@@ -627,6 +627,135 @@ struct CachedRmsnormWorkload {
 };
 static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedRmsnormWorkload> g_rmsnorm_cache;
 
+// Cached fused norm+GEMV workload: single program with rmsnorm + GEMV on 12 cores.
+struct CachedFusedNormGemvWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t>, CachedFusedNormGemvWorkload> g_fused_norm_gemv_cache;
+
+// Fused norm+GEMV: computes RMSNorm(hidden) on each core, then GEMV with sharded weights.
+// Eliminates separate rmsnorm program and intermediate norm buffer.
+static void dispatch_fused_norm_gemv(MeshDevice* device,
+                                      std::shared_ptr<MeshBuffer> hidden_buf,
+                                      std::shared_ptr<MeshBuffer> norm_weight_buf,
+                                      std::shared_ptr<MeshBuffer> weight_buf,
+                                      std::shared_ptr<MeshBuffer> out_buf,
+                                      uint32_t M, uint32_t K,
+                                      tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)hidden_buf->address(),
+                               (uint32_t)norm_weight_buf->address(),
+                               (uint32_t)weight_buf->address(),
+                               (uint32_t)out_buf->address());
+    auto& cached = g_fused_norm_gemv_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+
+        uint32_t Kt = K / TILE_WIDTH;
+        uint32_t Mt = M / TILE_HEIGHT;
+        uint32_t num_banks = g_num_dram_banks;
+        uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = g_dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
+
+        Program program = CreateProgram();
+
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+        uint32_t weight_tile_bytes = tile_size(weight_format);
+
+        uint32_t effective_block = 16;
+        uint32_t weight_cb_tiles = effective_block * 2;
+
+        // CB c_0: activation tiles (all Kt, holds normalized result)
+        CircularBufferConfig cb_act_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_act_cfg);
+
+        // CB c_1: weight tiles (double-buffered BLOCK)
+        CircularBufferConfig cb_weight_cfg =
+            CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+                .set_page_size(CBIndex::c_1, weight_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_weight_cfg);
+
+        // CB c_2: norm weight tiles (all Kt, temporary)
+        CircularBufferConfig cb_norm_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_norm_cfg);
+
+        // CB c_16: output tiles
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
+
+        // Fused reader: rmsnorm + weight reads
+        std::vector<uint32_t> reader_ct_args = {
+            (uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1,
+            (uint32_t)CBIndex::c_2, Kt, effective_block
+        };
+        TensorAccessorArgs(*hidden_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*norm_weight_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_gemv_fused_norm.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute kernel: same GEMV compute (Kt, BLOCK)
+        std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), all_cores,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        // Writer kernel: same multi-core writer
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_multicore.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        // Set per-core runtime args
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = g_dram_workers[b];
+            uint32_t start_row = b * Mt_per_bank;
+            uint32_t mt_this_core = (start_row >= Mt) ? 0 :
+                                    std::min(Mt_per_bank, Mt - start_row);
+
+            SetRuntimeArgs(program, reader_kid, core,
+                           {(uint32_t)hidden_buf->address(),
+                            (uint32_t)norm_weight_buf->address(),
+                            (uint32_t)weight_buf->address(),
+                            mt_this_core, b, K});
+
+            SetRuntimeArgs(program, compute_kid, core,
+                           {mt_this_core});
+
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)out_buf->address(), mt_this_core, start_row});
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
 // Dispatch custom RMSNorm: out = rms_norm(input) * weight
 // All buffers are [1, n_embd_padded] BF16 on device.
 // MeshWorkload is cached and reused — trace-compatible after first warmup call.
@@ -647,10 +776,17 @@ static void dispatch_rmsnorm(MeshDevice* device,
 
         uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
 
-        CircularBufferConfig cb_cfg =
-            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+        // CB c_0: input tiles (all n_tiles at once for batched read)
+        CircularBufferConfig cb_in_cfg =
+            CircularBufferConfig(n_tiles * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_0, tile_bytes);
-        CreateCircularBuffer(program, core, cb_cfg);
+        CreateCircularBuffer(program, core, cb_in_cfg);
+
+        // CB c_1: weight tiles (all n_tiles at once for batched read)
+        CircularBufferConfig cb_w_cfg =
+            CircularBufferConfig(n_tiles * tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_1, tile_bytes);
+        CreateCircularBuffer(program, core, cb_w_cfg);
 
         std::vector<uint32_t> ct_args = {n_tiles};
         TensorAccessorArgs(*in_buf).append_to(ct_args);
@@ -737,14 +873,12 @@ static bool g_norm_matmul_traces_valid[32] = {};
 static MeshTraceId g_ffn_chain_traces[32];
 static bool g_ffn_chain_traces_valid[32] = {};
 
-// Run norm + matmul on device using custom kernels (no ttnn dependency)
-// g_hidden_dev_buf → dispatch_rmsnorm → g_norm_dev_buf → dispatch_gemv → out_buf
+// Run norm on host + matmul on device.
+// Reads hidden from device, does fast AVX-512 rmsnorm on host, writes normalized
+// result to device, dispatches GEMV.
 static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
                             std::shared_ptr<MeshBuffer> weight_buf,
                             uint32_t M, uint32_t K) {
-    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
-                     g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), M, K);
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
 }
@@ -1329,40 +1463,191 @@ static float* forward_decode() {
     // Write hidden state to device (chip 0) — stays on device through all layers
     write_hidden_to_device(g_hidden_f32.data());
 
+    // One-time micro-benchmark: measure per-program overhead at decode 5
+    if (g_decode_count == 5) {
+        Finish(cq0);  // drain everything
+        auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
+
+        // Warmup: ensure cached
+        dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+                         g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                      gb_test.out_buf, g_combined_rows, MC::n_embd);
+        Finish(cq0);
+
+        // Test 1: Time 10x single GEMV dispatch+Finish
+        auto ta = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            Finish(cq0);
+        }
+        auto tb = Clock::now();
+        double t_single = std::chrono::duration<double, std::milli>(tb - ta).count() / 10.0;
+
+        // Test 2: Time 10x Finish-only (already synced)
+        auto tc = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            Finish(cq0);
+        }
+        auto td = Clock::now();
+        double t_finish = std::chrono::duration<double, std::milli>(td - tc).count() / 10.0;
+
+        // Test 3: Time 10x (fused norm+GEMV + Finish)
+        auto te = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_fused_norm_gemv(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+                                     g_wt.ssm_w_combined_buf[0], gb_test.out_buf,
+                                     g_combined_rows, MC::n_embd);
+            Finish(cq0);
+        }
+        auto tf = Clock::now();
+        double t_norm_gemv = std::chrono::duration<double, std::milli>(tf - te).count() / 10.0;
+
+        // Test 4: Time 10x full FFN chain dispatch+Finish
+        // First ensure FFN chain trace is warm for layer 0
+        write_f32_to_buf(g_residual_dev_buf, g_hidden_f32.data(), MC::ssm_d_inner);
+        if (!g_ffn_chain_traces_valid[0]) {
+            outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
+                                  g_wt.post_norm_buf[0],
+                                  g_wt.ssm_ffn_gate_buf[0], g_wt.ssm_ffn_up_buf[0],
+                                  g_wt.ssm_ffn_down_buf[0]);
+            Finish(cq0);
+            auto tid = g_mesh->begin_mesh_trace(0);
+            outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
+                                  g_wt.post_norm_buf[0],
+                                  g_wt.ssm_ffn_gate_buf[0], g_wt.ssm_ffn_up_buf[0],
+                                  g_wt.ssm_ffn_down_buf[0]);
+            g_mesh->end_mesh_trace(0, tid);
+            g_ffn_chain_traces[0] = tid;
+            g_ffn_chain_traces_valid[0] = true;
+        }
+        Finish(cq0);
+
+        auto tg = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[0], false);
+            Finish(cq0);
+        }
+        auto th = Clock::now();
+        double t_ffn_trace = std::chrono::duration<double, std::milli>(th - tg).count() / 10.0;
+
+        // Test 5: Time 10x pipelined GEMV (no Finish between)
+        auto ti = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+        }
+        Finish(cq0);
+        auto tj = Clock::now();
+        double t_pipelined = std::chrono::duration<double, std::milli>(tj - ti).count() / 10.0;
+
+        // Test 6: rmsnorm alone + Finish
+        Finish(cq0);
+        auto t6a = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+                             g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
+            Finish(cq0);
+        }
+        auto t6b = Clock::now();
+        double t_norm_only = std::chrono::duration<double, std::milli>(t6b - t6a).count() / 10.0;
+
+        // Test 7: Two different GEMVs (different weight buffers) + Finish
+        Finish(cq0);
+        auto t7a = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[1],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            Finish(cq0);
+        }
+        auto t7b = Clock::now();
+        double t_two_diff_gemv = std::chrono::duration<double, std::milli>(t7b - t7a).count() / 10.0;
+
+        // Test 8: Two same GEMVs + Finish (for comparison)
+        Finish(cq0);
+        auto t8a = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            Finish(cq0);
+        }
+        auto t8b = Clock::now();
+        double t_two_same_gemv = std::chrono::duration<double, std::milli>(t8b - t8a).count() / 10.0;
+
+        // Test 9: eltwise add alone + Finish
+        Finish(cq0);
+        constexpr uint32_t embd_tiles_test = MC::n_embd / TILE_WIDTH;
+        auto t9a = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_eltwise_binary(g_mesh.get(), 0, g_hidden_dev_buf, gb_test.out_buf,
+                                    g_hidden_dev_buf, embd_tiles_test);
+            Finish(cq0);
+        }
+        auto t9b = Clock::now();
+        double t_eltwise = std::chrono::duration<double, std::milli>(t9b - t9a).count() / 10.0;
+
+        // Test 10: GEMV + eltwise + Finish
+        Finish(cq0);
+        auto t10a = Clock::now();
+        for (int r = 0; r < 10; r++) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
+                          gb_test.out_buf, g_combined_rows, MC::n_embd);
+            dispatch_eltwise_binary(g_mesh.get(), 0, g_hidden_dev_buf, gb_test.out_buf,
+                                    g_hidden_dev_buf, embd_tiles_test);
+            Finish(cq0);
+        }
+        auto t10b = Clock::now();
+        double t_gemv_eltwise = std::chrono::duration<double, std::milli>(t10b - t10a).count() / 10.0;
+
+        printf("=== Per-program overhead benchmark ===\n");
+        printf("  Single GEMV + Finish:     %.3f ms\n", t_single);
+        printf("  Finish-only (no-op):      %.3f ms\n", t_finish);
+        printf("  norm+GEMV + Finish:       %.3f ms\n", t_norm_gemv);
+        printf("  FFN chain trace + Finish: %.3f ms\n", t_ffn_trace);
+        printf("  Pipelined GEMV (10x):     %.3f ms/each\n", t_pipelined);
+        printf("  rmsnorm alone + Finish:   %.3f ms\n", t_norm_only);
+        printf("  2x diff GEMV + Finish:    %.3f ms\n", t_two_diff_gemv);
+        printf("  2x same GEMV + Finish:    %.3f ms\n", t_two_same_gemv);
+        printf("  eltwise add + Finish:     %.3f ms\n", t_eltwise);
+        printf("  GEMV + eltwise + Finish:  %.3f ms\n", t_gemv_eltwise);
+        printf("  GEMV data: %.1f MB\n",
+               (double)(g_combined_rows * MC::n_embd) * 1.0625 / 1e6);
+        fflush(stdout);
+    }
+
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
-
         if (MC::is_recurrent(layer)) {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
-            // 1. Norm + combined matmul ON DEVICE (eliminates norm_out PCIe write)
+            // 1. Host rmsnorm + combined GEMV on device (eliminates 1.9ms device rmsnorm)
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
             auto t0 = Clock::now();
 
-            if (!g_norm_matmul_traces_valid[layer]) {
-                // Warmup
-                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
-                               g_combined_rows, MC::n_embd);
-                EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
-                // Capture trace
-                auto tid = g_mesh->begin_mesh_trace(0);
-                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
-                               g_combined_rows, MC::n_embd);
-                g_mesh->end_mesh_trace(0, tid);
-                g_norm_matmul_traces[layer] = tid;
-                g_norm_matmul_traces_valid[layer] = true;
-            } else {
-                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
-            }
+            // Read hidden from device (blocking read waits for prev FFN chain)
+            if (layer > 0)
+                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+
+            // Host rmsnorm (~0.03ms vs 1.9ms on device)
+            rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
+                    g_norm_out.data(), MC::n_embd);
+            write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
+
+            // GEMV only (~0.4ms)
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
+                          gb_comb.out_buf, g_combined_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
 
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize combined result
-            auto t_ut = Clock::now();
             read_gemv_to_f32(gb_comb, g_proj.data(), g_combined_rows);
-            g_time_untilize += std::chrono::duration<double, std::milli>(Clock::now() - t_ut).count();
 
             auto t_host0 = Clock::now();
             float* qkv_raw = g_proj.data();
@@ -1518,7 +1803,6 @@ static float* forward_decode() {
                 g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
-            // Hidden state stays on device — no read needed!
 
             ssm_idx++;
         } else {
@@ -1526,33 +1810,30 @@ static float* forward_decode() {
             auto& lw = g_model.attn_layers[attn_idx];
             auto& aw = g_attn_small[attn_idx];
 
-            // 1. Norm + QKV matmul ON DEVICE
+            // 1. Host rmsnorm + QKV GEMV on device (eliminates 1.9ms device rmsnorm)
             auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
             auto t0 = Clock::now();
 
-            if (!g_norm_matmul_traces_valid[layer]) {
-                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
-                               g_qkv_rows, MC::n_embd);
-                EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
-                auto tid = g_mesh->begin_mesh_trace(0);
-                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
-                               g_qkv_rows, MC::n_embd);
-                g_mesh->end_mesh_trace(0, tid);
-                g_norm_matmul_traces[layer] = tid;
-                g_norm_matmul_traces_valid[layer] = true;
-            } else {
-                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
-            }
+            // Read hidden from device (blocking read waits for prev FFN chain)
+            if (layer > 0)
+                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+
+            // Host rmsnorm (~0.03ms vs 1.9ms on device)
+            rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
+                    g_norm_out.data(), MC::n_embd);
+            write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
+
+            // QKV GEMV only (~0.4ms)
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
+                          gb_qkv.out_buf, g_qkv_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize QKV result
-            auto t_ut2 = Clock::now();
             constexpr int q_dim = MC::n_head * MC::head_dim * 2;
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
             read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
-            g_time_untilize += std::chrono::duration<double, std::milli>(Clock::now() - t_ut2).count();
 
             auto t_host1 = Clock::now();
             // 2. Deinterleave Q and gate
@@ -1659,15 +1940,25 @@ static float* forward_decode() {
         }
     }
 
-    // Fused output norm + LM head matmul on chip 0 (traced, no host round-trip)
+    // Output norm (host) + LM head GEMV (device)
     auto t_lm = Clock::now();
     auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
 
+    // Read hidden from device (waits for last FFN chain)
+    read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+
+    // Host rmsnorm with output norm weights
+    rmsnorm(g_hidden_f32.data(), g_output_norm.data(), g_norm_out.data(), MC::n_embd);
+    write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
+
+    // LM head GEMV (traced for fast dispatch)
     if (!g_lmhead_trace_valid) {
-        norm_lmhead_ops();
-        EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                      MC::n_vocab, MC::n_embd);
+        Finish(cq0);
         auto tid = g_mesh->begin_mesh_trace(0);
-        norm_lmhead_ops();
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                      MC::n_vocab, MC::n_embd);
         g_mesh->end_mesh_trace(0, tid);
         g_lmhead_trace = tid;
         g_lmhead_trace_valid = true;
@@ -1823,11 +2114,11 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // Forward pass with generated token
-        const bfloat16* emb = reinterpret_cast<const bfloat16*>(
-            g_model.tok_embd_host.data() + (size_t)next_token * MC::n_embd);
+        // Forward pass with generated token (raw bf16→f32 bit ops)
+        const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)next_token * MC::n_embd;
+        uint32_t* hbits = reinterpret_cast<uint32_t*>(g_hidden_f32.data());
         for (int j = 0; j < MC::n_embd; j++)
-            g_hidden_f32[j] = static_cast<float>(emb[j]);
+            hbits[j] = static_cast<uint32_t>(emb[j]) << 16;
 
         const float* logits = forward_decode();
         g_pos++;

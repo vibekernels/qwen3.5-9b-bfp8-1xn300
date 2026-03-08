@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Single-kernel RMSNorm: reads input + weight, computes RMSNorm in scalar, writes output.
-// No compute kernel needed — runs entirely on the dataflow RISC-V.
-// For [1, 4096] vectors this takes ~10us.
-//
-// Uses a single CB as L1 scratch (reserve, read, process, release pattern).
+// OPTIMIZED: batched NOC reads — all tiles read at once, single barrier.
+// Uses two CBs: cb_in for input tiles (retained for pass 2), cb_weight for weight tiles.
 //
 // Compile-time args: [n_tiles, acc_in_config, acc_weight_config, acc_out_config]
 // Runtime args: [in_addr, weight_addr, out_addr, n_elements]
@@ -32,8 +30,9 @@ void kernel_main() {
 
     constexpr uint32_t n_tiles = get_compile_time_arg_val(0);
 
-    constexpr uint32_t cb_scratch = tt::CBIndex::c_0;
-    uint32_t tile_size = get_tile_size(cb_scratch);
+    constexpr uint32_t cb_in = tt::CBIndex::c_0;
+    constexpr uint32_t cb_weight = tt::CBIndex::c_1;
+    uint32_t tile_size = get_tile_size(cb_in);
 
     constexpr auto acc_in_args = TensorAccessorArgs<1>();
     const auto acc_in = TensorAccessor(acc_in_args, in_addr, tile_size);
@@ -42,19 +41,21 @@ void kernel_main() {
     constexpr auto acc_out_args = TensorAccessorArgs<acc_w_args.next_compile_time_args_offset()>();
     const auto acc_out = TensorAccessor(acc_out_args, out_addr, tile_size);
 
-    // Pass 1: compute sum of squares
-    // Data layout in bf16 tiles: row 0 = elements [0..15], row 16 = elements [16..31]
-    float sum_sq = 0.0f;
-
+    // ---- Read ALL input tiles at once (batched NOC read) ----
+    cb_reserve_back(cb_in, n_tiles);
+    uint32_t in_l1_base = get_write_ptr(cb_in);
     for (uint32_t t = 0; t < n_tiles; t++) {
-        cb_reserve_back(cb_scratch, 1);
-        uint32_t l1_addr = get_write_ptr(cb_scratch);
-        noc_async_read_tile(t, acc_in, l1_addr);
-        noc_async_read_barrier();
+        noc_async_read_tile(t, acc_in, in_l1_base + t * tile_size);
+    }
+    noc_async_read_barrier();  // single barrier for all reads
+    cb_push_back(cb_in, n_tiles);
 
-        volatile tt_l1_ptr uint16_t* d = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_addr);
+    // ---- Pass 1: compute sum of squares from all tiles ----
+    cb_wait_front(cb_in, n_tiles);
+    float sum_sq = 0.0f;
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        volatile tt_l1_ptr uint16_t* d = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in_l1_base + t * tile_size);
         uint32_t base = t * 32;
-
         for (uint32_t j = 0; j < 16 && (base + j) < n_elements; j++) {
             float v = bf16_to_f32(d[j]);
             sum_sq += v * v;
@@ -63,14 +64,9 @@ void kernel_main() {
             float v = bf16_to_f32(d[256 + j]);
             sum_sq += v * v;
         }
-
-        // Release CB slot so we can reuse it
-        cb_push_back(cb_scratch, 1);
-        cb_wait_front(cb_scratch, 1);
-        cb_pop_front(cb_scratch, 1);
     }
 
-    // Compute 1/sqrt(mean(x^2) + eps) using fast inverse sqrt
+    // Compute 1/sqrt(mean(x^2) + eps) using fast inverse sqrt (2 Newton iterations)
     float mean_sq = sum_sq / (float)n_elements;
     float val = mean_sq + 1e-6f;
     float x2 = val * 0.5f;
@@ -82,51 +78,41 @@ void kernel_main() {
     norm_factor = norm_factor * (1.5f - x2 * norm_factor * norm_factor);
     norm_factor = norm_factor * (1.5f - x2 * norm_factor * norm_factor);
 
-    // Pass 2: normalize and multiply by weight
-    // For each tile: read input, read weight, compute out = x * norm_factor * w, write output
+    // ---- Read ALL weight tiles at once (batched NOC read) ----
+    cb_reserve_back(cb_weight, n_tiles);
+    uint32_t w_l1_base = get_write_ptr(cb_weight);
     for (uint32_t t = 0; t < n_tiles; t++) {
-        // Read input tile
-        cb_reserve_back(cb_scratch, 1);
-        uint32_t l1_addr = get_write_ptr(cb_scratch);
-        noc_async_read_tile(t, acc_in, l1_addr);
-        noc_async_read_barrier();
+        noc_async_read_tile(t, acc_w, w_l1_base + t * tile_size);
+    }
+    noc_async_read_barrier();  // single barrier for all weight reads
+    cb_push_back(cb_weight, n_tiles);
+    cb_wait_front(cb_weight, n_tiles);
 
-        volatile tt_l1_ptr uint16_t* d = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_addr);
+    // ---- Pass 2: normalize, multiply by weight, write output ----
+    // Input tiles still in cb_in L1, weight tiles in cb_weight L1.
+    // Write output in-place over weight tiles (reuse L1 space).
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        volatile tt_l1_ptr uint16_t* in_d = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in_l1_base + t * tile_size);
+        volatile tt_l1_ptr uint16_t* w_d = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(w_l1_base + t * tile_size);
         uint32_t base = t * 32;
 
-        // Extract normalized input values
-        float norm_vals[32];
-        for (uint32_t j = 0; j < 16; j++) {
-            norm_vals[j] = (base + j < n_elements) ? bf16_to_f32(d[j]) * norm_factor : 0.0f;
+        // Face 0: elements [0..15]
+        for (uint32_t j = 0; j < 16 && (base + j) < n_elements; j++) {
+            float result = bf16_to_f32(in_d[j]) * norm_factor * bf16_to_f32(w_d[j]);
+            w_d[j] = f32_to_bf16(result);
         }
-        for (uint32_t j = 0; j < 16; j++) {
-            norm_vals[16 + j] = (base + 16 + j < n_elements) ? bf16_to_f32(d[256 + j]) * norm_factor : 0.0f;
-        }
-
-        // Read weight tile into same L1 slot
-        noc_async_read_tile(t, acc_w, l1_addr);
-        noc_async_read_barrier();
-
-        // Multiply by weight and write back
-        for (uint32_t j = 0; j < 16; j++) {
-            if (base + j < n_elements) {
-                float result = norm_vals[j] * bf16_to_f32(d[j]);
-                d[j] = f32_to_bf16(result);
-            }
-        }
-        for (uint32_t j = 0; j < 16; j++) {
-            if (base + 16 + j < n_elements) {
-                float result = norm_vals[16 + j] * bf16_to_f32(d[256 + j]);
-                d[256 + j] = f32_to_bf16(result);
-            }
+        // Face 2: elements [16..31]
+        for (uint32_t j = 0; j < 16 && (base + 16 + j) < n_elements; j++) {
+            float result = bf16_to_f32(in_d[256 + j]) * norm_factor * bf16_to_f32(w_d[256 + j]);
+            w_d[256 + j] = f32_to_bf16(result);
         }
 
-        // Write output tile
-        noc_async_write_tile(t, acc_out, l1_addr);
-        noc_async_write_barrier();
-
-        cb_push_back(cb_scratch, 1);
-        cb_wait_front(cb_scratch, 1);
-        cb_pop_front(cb_scratch, 1);
+        // Write output tile (from weight L1 slot which now holds result)
+        noc_async_write_tile(t, acc_out, w_l1_base + t * tile_size);
     }
+    noc_async_write_barrier();  // single barrier for all writes
+
+    // Release CBs
+    cb_pop_front(cb_in, n_tiles);
+    cb_pop_front(cb_weight, n_tiles);
 }
