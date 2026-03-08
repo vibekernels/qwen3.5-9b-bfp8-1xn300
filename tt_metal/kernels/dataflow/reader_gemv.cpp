@@ -1,52 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
-// Reader kernel for GEMV: y = W @ x
-// Reads weight tiles from DRAM and the input activation vector (broadcast to all cores).
-// Each core computes a subset of output rows.
-//
-// W is stored in tiled layout in DRAM: [N_tiles, K_tiles] tiles
-// x is a single row of tiles: [1, K_tiles] tiles (same for all cores)
-//
-// This reader fetches tiles for the rows assigned to this core.
+// Reader for GEMV: y[1,M] = x[1,K] @ W[M,K]^T
+// Streams activation x (reused) and weight tile-rows for each output tile.
+// Compile-time args: [cb_act, cb_weight, Kt, acc_act_config, acc_weight_config]
+// Runtime args: [act_addr, weight_addr, Mt]
 
 #include "api/dataflow/dataflow_api.h"
+#include <cstdint>
 
 void kernel_main() {
-    // Runtime args
-    uint32_t w_addr       = get_arg_val<uint32_t>(0);  // Weight buffer address
-    uint32_t x_addr       = get_arg_val<uint32_t>(1);  // Input vector buffer address
-    uint32_t start_row    = get_arg_val<uint32_t>(2);  // First output row (in tiles) for this core
-    uint32_t num_rows     = get_arg_val<uint32_t>(3);  // Number of output rows for this core
-    uint32_t Kt           = get_arg_val<uint32_t>(4);  // K dimension in tiles
+    uint32_t act_addr    = get_arg_val<uint32_t>(0);
+    uint32_t weight_addr = get_arg_val<uint32_t>(1);
+    uint32_t Mt          = get_arg_val<uint32_t>(2);
 
-    constexpr uint32_t cb_w = tt::CBIndex::c_0;   // Weight tiles
-    constexpr uint32_t cb_x = tt::CBIndex::c_1;   // Input tiles
+    constexpr uint32_t cb_act    = get_compile_time_arg_val(0);
+    constexpr uint32_t cb_weight = get_compile_time_arg_val(1);
+    constexpr uint32_t Kt        = get_compile_time_arg_val(2);
 
-    // TensorAccessor for weight and input buffers
-    constexpr auto w_args = TensorAccessorArgs<0>();
-    const auto w_accessor = TensorAccessor(w_args, w_addr, get_tile_size(cb_w));
-    constexpr auto x_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
-    const auto x_accessor = TensorAccessor(x_args, x_addr, get_tile_size(cb_x));
+    uint32_t act_tile_size    = get_tile_size(cb_act);
+    uint32_t weight_tile_size = get_tile_size(cb_weight);
 
-    // For each output row assigned to this core
-    for (uint32_t row = 0; row < num_rows; row++) {
-        uint32_t w_row = start_row + row;
+    constexpr auto acc_act_args = TensorAccessorArgs<3>();
+    const auto acc_act = TensorAccessor(acc_act_args, act_addr, act_tile_size);
 
-        // Stream through K dimension
+    constexpr auto acc_weight_args = TensorAccessorArgs<acc_act_args.next_compile_time_args_offset()>();
+    const auto acc_weight = TensorAccessor(acc_weight_args, weight_addr, weight_tile_size);
+
+    // For each output tile mt: stream Kt pairs of (act, weight) tiles
+    // Weight is stored [M, K] row-major tiled, transposed for matmul
+    for (uint32_t mt = 0; mt < Mt; mt++) {
         for (uint32_t kt = 0; kt < Kt; kt++) {
-            // Read weight tile W[w_row, kt]
-            uint32_t w_tile_idx = w_row * Kt + kt;
-            cb_reserve_back(cb_w, 1);
-            uint32_t w_l1_addr = get_write_ptr(cb_w);
-            noc_async_read_tile(w_tile_idx, w_accessor, w_l1_addr);
+            // Activation tile [0, kt] — same for every mt
+            cb_reserve_back(cb_act, 1);
+            uint32_t l1_act = get_write_ptr(cb_act);
+            noc_async_read_tile(kt, acc_act, l1_act);
             noc_async_read_barrier();
-            cb_push_back(cb_w, 1);
+            cb_push_back(cb_act, 1);
 
-            // Read input tile x[0, kt]
-            cb_reserve_back(cb_x, 1);
-            uint32_t x_l1_addr = get_write_ptr(cb_x);
-            noc_async_read_tile(kt, x_accessor, x_l1_addr);
+            // Weight tile [mt, kt]
+            cb_reserve_back(cb_weight, 1);
+            uint32_t l1_weight = get_write_ptr(cb_weight);
+            noc_async_read_tile(mt * Kt + kt, acc_weight, l1_weight);
             noc_async_read_barrier();
-            cb_push_back(cb_x, 1);
+            cb_push_back(cb_weight, 1);
         }
     }
 }

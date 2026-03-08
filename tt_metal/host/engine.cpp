@@ -8,11 +8,8 @@
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/operations/eltwise/unary/unary.hpp>
-#include <ttnn/operations/eltwise/binary/binary.hpp>
-#include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/operations/trace.hpp>
+
 #include <ttnn/types.hpp>
 
 #include "engine.h"
@@ -26,6 +23,7 @@
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/device.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -100,6 +98,10 @@ struct WeightTensors {
     Tensor attn_norm[32];        // pre-attention norm for each layer
     Tensor post_norm[32];        // post-attention norm for each layer
     Tensor output_norm_tensor;   // final output norm
+
+    // Raw norm weight buffers (for custom dispatch_rmsnorm)
+    std::shared_ptr<MeshBuffer> attn_norm_buf[32];
+    std::shared_ptr<MeshBuffer> post_norm_buf[32];
 };
 static WeightTensors g_wt;
 
@@ -206,7 +208,7 @@ static std::vector<uint16_t> g_bf16_scratch(MC::n_vocab_padded);
 
 // Per-matmul trace storage: indexed by a sequential ID per unique weight
 struct GemvTrace {
-    ttnn::MeshTraceId trace_id;
+    MeshTraceId trace_id;
     bool valid = false;
 };
 static GemvTrace g_gemv_traces[128];  // max 65 unique matmuls + headroom
@@ -253,13 +255,13 @@ static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, ui
         if (!tr.valid) {
             do_matmul();
             EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
-            auto tid = ttnn::operations::trace::begin_trace_capture(device, std::nullopt);
+            auto tid = device->begin_mesh_trace(0);
             do_matmul();
-            ttnn::operations::trace::end_trace_capture(device, tid, std::nullopt);
+            device->end_mesh_trace(0, tid);
             tr.trace_id = tid;
             tr.valid = true;
         } else {
-            ttnn::operations::trace::execute_trace(device, tr.trace_id, std::nullopt, false);
+            device->replay_mesh_trace(0, tr.trace_id, false);
         }
     } else {
         do_matmul();
@@ -290,6 +292,241 @@ static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, ui
     g_t_read += std::chrono::duration<double, std::milli>(t3 - t2).count();
     g_t_host += std::chrono::duration<double, std::milli>(t4 - t3).count();
     g_gemv_count++;
+}
+
+// ============================================================================
+// Custom tt-metal kernel dispatch (replaces ttnn ops)
+// ============================================================================
+static std::string kernel_path(const char* rel) {
+    return std::string(KERNEL_DIR) + "/" + rel;
+}
+
+// Cached eltwise binary workload: created once, reused across calls (trace-compatible).
+// Key = (op_type, src0_addr, src1_addr, dst_addr, n_tiles)
+struct CachedEltwiseWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>, CachedEltwiseWorkload> g_eltwise_cache;
+
+// Dispatch an elementwise binary op (add or multiply) on device.
+// op_type: 0 = add, 1 = multiply
+// Result is written to dst_buf.
+// MeshWorkload is cached and reused — trace-compatible after first warmup call.
+static void dispatch_eltwise_binary(MeshDevice* device, uint32_t op_type,
+                                     std::shared_ptr<MeshBuffer> src0_buf,
+                                     std::shared_ptr<MeshBuffer> src1_buf,
+                                     std::shared_ptr<MeshBuffer> dst_buf,
+                                     uint32_t n_tiles) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple(op_type, (uint32_t)src0_buf->address(),
+                               (uint32_t)src1_buf->address(), (uint32_t)dst_buf->address(), n_tiles);
+    auto& cached = g_eltwise_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+        Program program = CreateProgram();
+        tt::tt_metal::CoreCoord core = {0, 0};
+
+        uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+        CircularBufferConfig cb0_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, tile_bytes);
+        CreateCircularBuffer(program, core, cb0_cfg);
+
+        CircularBufferConfig cb1_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_1, tile_bytes);
+        CreateCircularBuffer(program, core, cb1_cfg);
+
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, tile_bytes);
+        CreateCircularBuffer(program, core, cb_out_cfg);
+
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1};
+        TensorAccessorArgs(*src0_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*src1_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_binary_tiles.cpp"), core,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        SetRuntimeArgs(program, reader_kid, core,
+                       {(uint32_t)src0_buf->address(), (uint32_t)src1_buf->address(), n_tiles});
+
+        std::vector<uint32_t> compute_ct_args = {n_tiles, op_type};
+        CreateKernel(program,
+            kernel_path("compute/eltwise_binary.cpp"), core,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*dst_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_tiles.cpp"), core,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        SetRuntimeArgs(program, writer_kid, core,
+                       {(uint32_t)dst_buf->address(), n_tiles});
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached GEMV workload: created once per unique (M,K,weight) combo, reused across calls.
+struct CachedGemvWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedGemvWorkload> g_gemv_cache;
+
+// Dispatch custom GEMV: y[1,M] = x[1,K] @ W[M,K]^T
+// act_buf: [1, K_padded] BF16 activation on device
+// weight_buf: [M_padded, K_padded] BFP8_B weight on device (will be transposed)
+// out_buf: [1, M_padded] BF16 output on device
+// MeshWorkload is cached and reused — trace-compatible after first warmup call.
+static void dispatch_gemv(MeshDevice* device,
+                           std::shared_ptr<MeshBuffer> act_buf,
+                           std::shared_ptr<MeshBuffer> weight_buf,
+                           std::shared_ptr<MeshBuffer> out_buf,
+                           uint32_t M, uint32_t K,
+                           tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)act_buf->address(),
+                               (uint32_t)weight_buf->address(), (uint32_t)out_buf->address());
+    auto& cached = g_gemv_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+
+        uint32_t Kt = K / TILE_WIDTH;
+        uint32_t Mt = M / TILE_HEIGHT;
+
+        Program program = CreateProgram();
+        tt::tt_metal::CoreCoord core = {0, 0};
+
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+        uint32_t weight_tile_bytes = tile_size(weight_format);
+
+        CircularBufferConfig cb_act_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, core, cb_act_cfg);
+
+        CircularBufferConfig cb_weight_cfg =
+            CircularBufferConfig(2 * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+                .set_page_size(CBIndex::c_1, weight_tile_bytes);
+        CreateCircularBuffer(program, core, cb_weight_cfg);
+
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
+        CreateCircularBuffer(program, core, cb_out_cfg);
+
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt};
+        TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_gemv.cpp"), core,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        SetRuntimeArgs(program, reader_kid, core,
+                       {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(), Mt});
+
+        std::vector<uint32_t> compute_ct_args = {Mt, Kt};
+        CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), core,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv.cpp"), core,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        SetRuntimeArgs(program, writer_kid, core,
+                       {(uint32_t)out_buf->address(), Mt});
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached RMSNorm workload: created once, reused across calls (trace-compatible).
+struct CachedRmsnormWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedRmsnormWorkload> g_rmsnorm_cache;
+
+// Dispatch custom RMSNorm: out = rms_norm(input) * weight
+// All buffers are [1, n_embd_padded] BF16 on device.
+// MeshWorkload is cached and reused — trace-compatible after first warmup call.
+static void dispatch_rmsnorm(MeshDevice* device,
+                              std::shared_ptr<MeshBuffer> in_buf,
+                              std::shared_ptr<MeshBuffer> weight_buf,
+                              std::shared_ptr<MeshBuffer> out_buf,
+                              uint32_t n_elements, uint32_t n_tiles) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)in_buf->address(),
+                               (uint32_t)weight_buf->address(), (uint32_t)out_buf->address());
+    auto& cached = g_rmsnorm_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+        Program program = CreateProgram();
+        tt::tt_metal::CoreCoord core = {0, 0};
+
+        uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+        CircularBufferConfig cb_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, tile_bytes);
+        CreateCircularBuffer(program, core, cb_cfg);
+
+        std::vector<uint32_t> ct_args = {n_tiles};
+        TensorAccessorArgs(*in_buf).append_to(ct_args);
+        TensorAccessorArgs(*weight_buf).append_to(ct_args);
+        TensorAccessorArgs(*out_buf).append_to(ct_args);
+
+        auto kernel_id = CreateKernel(program,
+            kernel_path("dataflow/reader_rmsnorm.cpp"), core,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = ct_args});
+
+        SetRuntimeArgs(program, kernel_id, core,
+                       {(uint32_t)in_buf->address(), (uint32_t)weight_buf->address(),
+                        (uint32_t)out_buf->address(), n_elements});
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
 }
 
 // ============================================================================
@@ -346,11 +583,11 @@ static FfnBuf& get_ffn_buf(MeshDevice* device) {
 // Per-layer trace captures for on-device operations
 // ============================================================================
 // Trace for: rms_norm(hidden) → matmul(norm, weight) → result in gemv out buffer
-static ttnn::MeshTraceId g_norm_matmul_traces[32];
+static MeshTraceId g_norm_matmul_traces[32];
 static bool g_norm_matmul_traces_valid[32] = {};
 
 // Trace for: add_(hidden, residual) → rms_norm → FFN chain → add_(hidden, ffn_out)
-static ttnn::MeshTraceId g_ffn_chain_traces[32];
+static MeshTraceId g_ffn_chain_traces[32];
 static bool g_ffn_chain_traces_valid[32] = {};
 
 // Run norm + matmul on device (g_hidden_dev → norm → matmul → gemv out buffer)
@@ -378,10 +615,12 @@ static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                  std::nullopt, std::nullopt, gb_op.out_tensor);
 
-    // 2. Residual add: hidden += outproj result
-    ttnn::add_(g_hidden_dev, gb_op.out_tensor);
+    // 2. Residual add: hidden += outproj result (custom kernel)
+    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
+    dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_op.out_buf,
+                            g_hidden_dev_buf, embd_tiles);
 
-    // 3. RMSNorm
+    // 3. RMSNorm (ttnn multi-core for perf)
     auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, norm_weight);
 
     // 4. FFN: gate matmul (fused SiLU) + up matmul + multiply + down matmul
@@ -400,9 +639,10 @@ static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                  std::nullopt, std::nullopt, fb.up_tensor);
 
-    // Gate * Up
-    ttnn::multiply(fb.gate_tensor, fb.up_tensor, std::nullopt, ttnn::DRAM_MEMORY_CONFIG,
-                   fb.act_tensor);
+    // Gate * Up (custom kernel)
+    constexpr uint32_t ff_tiles = MC::n_ff / TILE_WIDTH;
+    dispatch_eltwise_binary(g_mesh.get(), 1 /*mul*/, fb.gate_buf, fb.up_buf,
+                            fb.act_buf, ff_tiles);
 
     // Down projection
     ttnn::matmul(fb.act_tensor, down_weight,
@@ -410,8 +650,9 @@ static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                  std::nullopt, std::nullopt, gb_dn.out_tensor);
 
-    // 5. Residual add: hidden += ffn_out
-    ttnn::add_(g_hidden_dev, gb_dn.out_tensor);
+    // 5. Residual add: hidden += ffn_out (custom kernel)
+    dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_dn.out_buf,
+                            g_hidden_dev_buf, embd_tiles);
 }
 
 // Separate tiled host buffer for write_f32_to_buf (declared before use)
@@ -670,11 +911,15 @@ static void create_weight_tensors() {
             auto& lw = g_model.ssm_layers[ssm_idx];
             g_wt.attn_norm[layer] = wrap_1d(lw.attn_norm, MC::n_embd);
             g_wt.post_norm[layer] = wrap_1d(lw.post_attn_norm, MC::n_embd);
+            g_wt.attn_norm_buf[layer] = lw.attn_norm;
+            g_wt.post_norm_buf[layer] = lw.post_attn_norm;
             ssm_idx++;
         } else {
             auto& lw = g_model.attn_layers[attn_idx];
             g_wt.attn_norm[layer] = wrap_1d(lw.attn_norm, MC::n_embd);
             g_wt.post_norm[layer] = wrap_1d(lw.post_attn_norm, MC::n_embd);
+            g_wt.attn_norm_buf[layer] = lw.attn_norm;
+            g_wt.post_norm_buf[layer] = lw.post_attn_norm;
             attn_idx++;
         }
     }
@@ -867,15 +1112,14 @@ static float* forward_decode() {
                                g_combined_rows, MC::n_embd);
                 EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
                 // Capture trace
-                auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
+                auto tid = g_mesh->begin_mesh_trace(0);
                 norm_matmul_ops(g_wt.attn_norm[layer], g_wt.ssm_w_combined[ssm_idx],
                                g_combined_rows, MC::n_embd);
-                ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
+                g_mesh->end_mesh_trace(0, tid);
                 g_norm_matmul_traces[layer] = tid;
                 g_norm_matmul_traces_valid[layer] = true;
             } else {
-                ttnn::operations::trace::execute_trace(g_mesh.get(), g_norm_matmul_traces[layer],
-                                                        std::nullopt, false);
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
             }
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
 
@@ -986,17 +1230,16 @@ static float* forward_decode() {
                                       g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
                                       g_wt.ssm_ffn_down[ssm_idx]);
                 Finish(cq0);
-                auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
+                auto tid = g_mesh->begin_mesh_trace(0);
                 outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                       g_wt.post_norm[layer],
                                       g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
                                       g_wt.ssm_ffn_down[ssm_idx]);
-                ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
+                g_mesh->end_mesh_trace(0, tid);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
             } else {
-                ttnn::operations::trace::execute_trace(g_mesh.get(), g_ffn_chain_traces[layer],
-                                                        std::nullopt, false);
+                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
             // Hidden state stays on device — no read needed!
@@ -1015,15 +1258,14 @@ static float* forward_decode() {
                 norm_matmul_ops(g_wt.attn_norm[layer], g_wt.attn_wqkv[attn_idx],
                                g_qkv_rows, MC::n_embd);
                 EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
-                auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
+                auto tid = g_mesh->begin_mesh_trace(0);
                 norm_matmul_ops(g_wt.attn_norm[layer], g_wt.attn_wqkv[attn_idx],
                                g_qkv_rows, MC::n_embd);
-                ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
+                g_mesh->end_mesh_trace(0, tid);
                 g_norm_matmul_traces[layer] = tid;
                 g_norm_matmul_traces_valid[layer] = true;
             } else {
-                ttnn::operations::trace::execute_trace(g_mesh.get(), g_norm_matmul_traces[layer],
-                                                        std::nullopt, false);
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
             }
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -1124,17 +1366,16 @@ static float* forward_decode() {
                                       g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
                                       g_wt.attn_ffn_down[attn_idx]);
                 Finish(cq0);
-                auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
+                auto tid = g_mesh->begin_mesh_trace(0);
                 outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                       g_wt.post_norm[layer],
                                       g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
                                       g_wt.attn_ffn_down[attn_idx]);
-                ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
+                g_mesh->end_mesh_trace(0, tid);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
             } else {
-                ttnn::operations::trace::execute_trace(g_mesh.get(), g_ffn_chain_traces[layer],
-                                                        std::nullopt, false);
+                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
 
@@ -1341,14 +1582,14 @@ void shutdown() {
     // Release norm+matmul traces (chip 0)
     for (int i = 0; i < 32; i++) {
         if (g_norm_matmul_traces_valid[i]) {
-            ttnn::operations::trace::release_trace(g_mesh.get(), g_norm_matmul_traces[i]);
+            g_mesh->release_mesh_trace(g_norm_matmul_traces[i]);
             g_norm_matmul_traces_valid[i] = false;
         }
     }
     // Release FFN chain traces (chip 0)
     for (int i = 0; i < 32; i++) {
         if (g_ffn_chain_traces_valid[i]) {
-            ttnn::operations::trace::release_trace(g_mesh.get(), g_ffn_chain_traces[i]);
+            g_mesh->release_mesh_trace(g_ffn_chain_traces[i]);
             g_ffn_chain_traces_valid[i] = false;
         }
     }
@@ -1356,10 +1597,15 @@ void shutdown() {
     for (int i = 0; i < 128; i++) {
         if (g_gemv_traces[i].valid) {
             MeshDevice* dev = (i == 64) ? g_mesh2.get() : g_mesh.get();
-            ttnn::operations::trace::release_trace(dev, g_gemv_traces[i].trace_id);
+            dev->release_mesh_trace(g_gemv_traces[i].trace_id);
             g_gemv_traces[i].valid = false;
         }
     }
+
+    // Clear cached custom kernel workloads (must happen before device close)
+    g_eltwise_cache.clear();
+    g_gemv_cache.clear();
+    g_rmsnorm_cache.clear();
 
     // Clear pre-allocated GEMV and FFN buffers
     g_ffn_bufs.clear();
