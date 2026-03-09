@@ -1167,12 +1167,14 @@ static bool g_ffn_chain_traces_valid[32] = {};
 static MeshTraceId g_ffn_chain_traces_1[32];
 static bool g_ffn_chain_traces_valid_1[32] = {};
 
-// Run norm on host + matmul on device.
-// Reads hidden from device, does fast AVX-512 rmsnorm on host, writes normalized
-// result to device, dispatches GEMV.
+// Run rmsnorm on device + GEMV on device (no host round-trip for norm).
+// Hidden must already be on device in g_hidden_dev_buf.
 static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
                             std::shared_ptr<MeshBuffer> weight_buf,
                             uint32_t M, uint32_t K) {
+    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                          g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), M, K);
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
 }
@@ -1376,6 +1378,71 @@ struct Chip1Writer {
 };
 
 static Chip1Writer g_chip1_writer;
+
+// Persistent thread pool for parallel-for work (deltanet v-head processing)
+// Uses C++20 atomic wait/notify (futex on Linux) — no mutex needed on hot path.
+struct WorkerPool {
+    static constexpr int N_WORKERS = 3;  // + main thread = 4 total
+    std::thread threads[N_WORKERS];
+    alignas(64) std::atomic<int> phase{0};       // incremented to signal new work
+    alignas(64) std::atomic<int> done_count{0};  // workers increment when done
+    std::atomic<bool> running{true};
+    std::function<void(int, int)> work_fn;
+    int ranges[N_WORKERS][2];
+
+    void start() {
+        for (int w = 0; w < N_WORKERS; w++) {
+            threads[w] = std::thread([this, w]{
+                int last_phase = 0;
+                while (true) {
+                    phase.wait(last_phase, std::memory_order_acquire);
+                    if (!running.load(std::memory_order_relaxed)) return;
+                    last_phase = phase.load(std::memory_order_relaxed);
+                    work_fn(ranges[w][0], ranges[w][1]);
+                    if (done_count.fetch_add(1, std::memory_order_acq_rel) == N_WORKERS - 1) {
+                        done_count.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    // Execute fn(start, end) in parallel across N_WORKERS+1 threads
+    void parallel_for(int total, std::function<void(int, int)> fn) {
+        int chunk = total / (N_WORKERS + 1);
+        int remainder = total % (N_WORKERS + 1);
+        int offset = 0;
+        for (int w = 0; w < N_WORKERS; w++) {
+            int sz = chunk + (w < remainder ? 1 : 0);
+            ranges[w][0] = offset;
+            ranges[w][1] = offset + sz;
+            offset += sz;
+        }
+        work_fn = std::move(fn);
+        done_count.store(0, std::memory_order_release);
+        phase.fetch_add(1, std::memory_order_release);
+        phase.notify_all();
+
+        // Main thread does its chunk
+        work_fn(offset, total);
+
+        // Wait for all workers (futex-based, no mutex)
+        while (done_count.load(std::memory_order_acquire) < N_WORKERS) {
+            done_count.wait(done_count.load(std::memory_order_relaxed), std::memory_order_acquire);
+        }
+    }
+
+    void stop() {
+        running.store(false, std::memory_order_release);
+        phase.fetch_add(1, std::memory_order_release);
+        phase.notify_all();
+        for (int w = 0; w < N_WORKERS; w++) {
+            if (threads[w].joinable()) threads[w].join();
+        }
+    }
+};
+
+static WorkerPool g_worker_pool;
 
 // Tilize + write to chip 1 device buffer using background staging buffer
 static void write_f32_to_chip1_bg(std::shared_ptr<MeshBuffer> buf, const float* data, uint32_t len) {
@@ -1954,6 +2021,18 @@ static inline float fast_siluf(float x) {
     return x * fast_sigmoidf(x);
 }
 
+// AVX-512 vectorized SiLU: x * sigmoid(x)
+static inline __m512 fast_silu_avx512(__m512 x) {
+    // Schraudolph's exp(-x): clamp, then bit manipulation
+    __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
+    neg_x = _mm512_max_ps(_mm512_set1_ps(-88.0f), _mm512_min_ps(_mm512_set1_ps(88.0f), neg_x));
+    __m512i exp_i = _mm512_cvtps_epi32(_mm512_fmadd_ps(neg_x, _mm512_set1_ps(12102203.0f), _mm512_set1_ps(1065353216.0f)));
+    __m512 exp_neg_x = _mm512_castsi512_ps(exp_i);
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    __m512 sigmoid = _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_x));
+    return _mm512_mul_ps(x, sigmoid);
+}
+
 // ============================================================================
 // Pre-allocated scratch buffers for forward_decode (avoid heap allocs per token)
 // ============================================================================
@@ -2192,18 +2271,22 @@ static float* forward_decode() {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
-            // 1. Host rmsnorm + combined GEMV on device
+            // 1. On-device rmsnorm + combined GEMV (traced)
             auto t0 = Clock::now();
 
-            // Read hidden from device (blocking read waits for prev FFN chain)
-            if (layer > 0) {
-                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
-                if (g_mesh1) {
-                    // TP reduction: add chip 1's partial down to hidden
+            // TP reduction: parallel reads from both chips, combine, write back
+            if (layer > 0 && g_mesh1) {
+                // Start chip 1 read on bg thread (overlaps with chip 0 read)
+                g_chip1_writer.submit([&]{
                     auto& cq1 = g_mesh1->mesh_command_queue();
                     read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
-                    for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
-                }
+                });
+                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+                g_chip1_writer.wait();
+                for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
+                write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
+            } else if (layer > 0) {
+                Finish(cq0);
             }
 
             auto t_after_read = Clock::now();
@@ -2216,21 +2299,25 @@ static float* forward_decode() {
                 });
             }
 
-            // Host rmsnorm (AVX-512, ~0.03ms — faster than device software float)
-            rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
-                    g_norm_out.data(), MC::n_embd);
-            write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
+            // On-device rmsnorm + GEMV trace (eliminates host rmsnorm + norm write)
+            if (!g_norm_matmul_traces_valid[layer]) {
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
+                                g_combined_rows, MC::n_embd);
+                Finish(cq0);
+                auto tid = g_mesh->begin_mesh_trace(0);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
+                                g_combined_rows, MC::n_embd);
+                g_mesh->end_mesh_trace(0, tid);
+                g_norm_matmul_traces[layer] = tid;
+                g_norm_matmul_traces_valid[layer] = true;
+            } else {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+            }
 
-            auto t_after_norm = Clock::now();
-            g_time_rmsnorm_write += std::chrono::duration<double, std::milli>(t_after_norm - t_after_read).count();
-
-            // GEMV on chip 0
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
-                          gb_comb.out_buf, g_combined_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
 
-            g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_norm).count();
+            g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize combined result
@@ -2247,17 +2334,25 @@ static float* forward_decode() {
             auto& cs = g_conv_state[ssm_idx];
             float* conv_out = g_conv_out.data();
             // Conv1d: sum = state[0..2] · weights[0..2] + input · weights[3]
-            // Layout: cs = [3 rows × 8192 channels], weights = [8192 × 4] row-major
+            // Layout: cs = [3 rows × 8192 channels], weights = [4 × 8192] (transposed for contiguous loads)
             const float* w = lw.ssm_conv1d_host.data();
+            constexpr int C = MC::ssm_conv_channels;
             const float* s0 = cs.data();
-            const float* s1 = cs.data() + MC::ssm_conv_channels;
-            const float* s2 = cs.data() + 2 * MC::ssm_conv_channels;
-            for (int ch = 0; ch < MC::ssm_conv_channels; ch++) {
-                float sum = s0[ch] * w[ch * 4 + 0]
-                          + s1[ch] * w[ch * 4 + 1]
-                          + s2[ch] * w[ch * 4 + 2]
-                          + qkv_raw[ch] * w[ch * 4 + 3];
-                conv_out[ch] = fast_siluf(sum);
+            const float* s1 = cs.data() + C;
+            const float* s2 = cs.data() + 2 * C;
+            // AVX-512 vectorized conv1d + SiLU (transposed weights: w[tap*C + ch])
+            for (int ch = 0; ch < C; ch += 16) {
+                __m512 vw0 = _mm512_loadu_ps(w + ch);
+                __m512 vw1 = _mm512_loadu_ps(w + C + ch);
+                __m512 vw2 = _mm512_loadu_ps(w + 2 * C + ch);
+                __m512 vw3 = _mm512_loadu_ps(w + 3 * C + ch);
+
+                __m512 vsum = _mm512_mul_ps(_mm512_loadu_ps(s0 + ch), vw0);
+                vsum = _mm512_fmadd_ps(_mm512_loadu_ps(s1 + ch), vw1, vsum);
+                vsum = _mm512_fmadd_ps(_mm512_loadu_ps(s2 + ch), vw2, vsum);
+                vsum = _mm512_fmadd_ps(_mm512_loadu_ps(qkv_raw + ch), vw3, vsum);
+
+                _mm512_storeu_ps(conv_out + ch, fast_silu_avx512(vsum));
             }
             // State update: shift rows and append new input
             memcpy(cs.data(), s1, MC::ssm_conv_channels * sizeof(float));
@@ -2337,7 +2432,7 @@ static float* forward_decode() {
                         ssm_proj_in[vh * head_v + i] = _mm512_reduce_add_ps(vout_acc) * ssm_scale;
                     }
 
-                    // Gated RMSNorm for this v-head (AVX-512)
+                    // Gated RMSNorm for this v-head (fully vectorized AVX-512)
                     float* vo = ssm_proj_in + vh * head_v;
                     __m512 vssq = _mm512_setzero_ps();
                     for (int d = 0; d < head_v; d += 16) {
@@ -2350,40 +2445,25 @@ static float* forward_decode() {
                         __m512 vv = _mm512_loadu_ps(vo + d);
                         __m512 vnorm = _mm512_mul_ps(_mm512_mul_ps(vv, vrms),
                                                       _mm512_loadu_ps(lw.ssm_norm_host.data() + d));
-                        float tmp[16];
-                        _mm512_storeu_ps(tmp, vnorm);
-                        for (int t = 0; t < 16 && d + t < head_v; t++) {
-                            float z = z_raw[vh * head_v + d + t];
-                            tmp[t] *= fast_siluf(z);
-                        }
-                        _mm512_storeu_ps(vo + d, _mm512_loadu_ps(tmp));
+                        __m512 vz = _mm512_loadu_ps(z_raw + vh * head_v + d);
+                        _mm512_storeu_ps(vo + d, _mm512_mul_ps(vnorm, fast_silu_avx512(vz)));
                     }
                 }
             };
 
-            // Parallelize across 4 threads (main + 3 workers)
-            constexpr int q1 = num_v / 4;
-            constexpr int q2 = num_v / 2;
-            constexpr int q3 = 3 * num_v / 4;
-            std::thread w1(process_vheads, 0, q1);
-            std::thread w2(process_vheads, q1, q2);
-            std::thread w3(process_vheads, q2, q3);
-            process_vheads(q3, num_v);
-            w1.join(); w2.join(); w3.join();
+            // Parallelize across 4 threads using persistent pool (main + 3 workers)
+            g_worker_pool.parallel_for(num_v, process_vheads);
 
             g_time_deltanet += std::chrono::duration<double, std::milli>(Clock::now() - t_delta).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host0).count();
 
-            // 6. Write residual + hidden to device, then outproj+FFN chain
+            // 6. Write residual to device, then outproj+FFN chain
+            // (hidden already on device — written before rmsnorm+GEMV trace in TP mode,
+            //  or left on device from previous FFN chain in non-TP mode)
             auto t_rw = Clock::now();
+            write_f32_to_buf(g_residual_dev_buf, ssm_proj_in, MC::ssm_d_inner);
             if (g_mesh1) {
-                // Chip 0: write residual + hidden (local, fast)
-                write_f32_to_buf(g_residual_dev_buf, ssm_proj_in, MC::ssm_d_inner);
-                write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
-                // Chip 1: wait for async hidden write (started before GEMV), then write residual async
-                g_chip1_writer.wait();  // hidden write done (overlapped with GEMV)
-            } else {
-                write_f32_to_buf(g_residual_dev_buf, ssm_proj_in, MC::ssm_d_inner);
+                g_chip1_writer.wait();  // wait for async hidden write to chip 1
             }
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw).count();
 
@@ -2461,17 +2541,21 @@ static float* forward_decode() {
             auto& lw = g_model.attn_layers[attn_idx];
             auto& aw = g_attn_small[attn_idx];
 
-            // 1. Host rmsnorm + QKV GEMV on device
+            // 1. On-device rmsnorm + QKV GEMV (traced)
             auto t0 = Clock::now();
 
-            // Read hidden from device (blocking read waits for prev FFN chain)
-            if (layer > 0) {
-                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
-                if (g_mesh1) {
+            // TP reduction: parallel reads from both chips, combine, write back
+            if (layer > 0 && g_mesh1) {
+                g_chip1_writer.submit([&]{
                     auto& cq1 = g_mesh1->mesh_command_queue();
                     read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
-                    for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
-                }
+                });
+                read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+                g_chip1_writer.wait();
+                for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
+                write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
+            } else if (layer > 0) {
+                Finish(cq0);
             }
 
             auto t_after_read = Clock::now();
@@ -2484,25 +2568,29 @@ static float* forward_decode() {
                 });
             }
 
-            // Host rmsnorm (AVX-512, faster than device software float)
-            rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
-                    g_norm_out.data(), MC::n_embd);
-            write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
-
-            auto t_after_norm = Clock::now();
-            g_time_rmsnorm_write += std::chrono::duration<double, std::milli>(t_after_norm - t_after_read).count();
-
-            // QKV GEMV
+            // On-device rmsnorm + QKV GEMV trace
             constexpr int q_dim = MC::n_head * MC::head_dim * 2;
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
 
             {
+                if (!g_norm_matmul_traces_valid[layer]) {
+                    norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                    g_qkv_rows, MC::n_embd);
+                    Finish(cq0);
+                    auto tid = g_mesh->begin_mesh_trace(0);
+                    norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                    g_qkv_rows, MC::n_embd);
+                    g_mesh->end_mesh_trace(0, tid);
+                    g_norm_matmul_traces[layer] = tid;
+                    g_norm_matmul_traces_valid[layer] = true;
+                } else {
+                    g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+                }
+
                 auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
-                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
-                              gb_qkv.out_buf, g_qkv_rows, MC::n_embd);
                 EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
-                g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_norm).count();
+                g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
                 g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
                 read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
@@ -2592,16 +2680,12 @@ static float* forward_decode() {
             g_time_attn_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
 
-            // 8. Write residual + hidden to device, then outproj+FFN chain
+            // 8. Write residual to device, then outproj+FFN chain
+            // (hidden already on device — written before rmsnorm+GEMV trace)
             auto t_rw2 = Clock::now();
+            write_f32_to_buf(g_residual_dev_buf, attn_out, MC::n_head * MC::head_dim);
             if (g_mesh1) {
-                // Chip 0: write residual + hidden (local, fast)
-                write_f32_to_buf(g_residual_dev_buf, attn_out, MC::n_head * MC::head_dim);
-                write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
-                // Chip 1: wait for async hidden write (started before GEMV)
-                g_chip1_writer.wait();
-            } else {
-                write_f32_to_buf(g_residual_dev_buf, attn_out, MC::n_head * MC::head_dim);
+                g_chip1_writer.wait();  // wait for async hidden write to chip 1
             }
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw2).count();
 
@@ -2675,12 +2759,14 @@ static float* forward_decode() {
     // Output norm (host) + LM head GEMV (device)
     auto t_lm = Clock::now();
 
-    // Read hidden from device (waits for last FFN chain)
-    read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+    // Read hidden from device (waits for last FFN chain) + TP reduction
     if (g_mesh1) {
+        read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
         auto& cq1 = g_mesh1->mesh_command_queue();
         read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
         for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
+    } else {
+        read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
     }
 
     // Host rmsnorm with output norm weights
@@ -2802,6 +2888,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         printf("Chip 1: compute grid %zux%zu (%zu cores)\n", grid1.x, grid1.y, grid1.x * grid1.y);
         g_chip1_writer.start();
     }
+    g_worker_pool.start();
 
     // Query DRAM bank topology for sharded GEMV (chip 0)
     g_num_dram_banks = g_mesh->num_dram_channels();
@@ -2966,8 +3053,9 @@ void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
 
-    // Stop background chip 1 writer thread
+    // Stop background threads
     g_chip1_writer.stop();
+    g_worker_pool.stop();
 
     // Release traces
     for (int i = 0; i < 32; i++) {

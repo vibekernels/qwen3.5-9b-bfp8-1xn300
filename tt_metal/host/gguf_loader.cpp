@@ -333,7 +333,17 @@ bool load_gguf_weights(
 
             // SSM parameters — stored on host as f32
             lw.ssm_a_host = load_f32(pname("ssm_a"));
-            lw.ssm_conv1d_host = load_f32(pname("ssm_conv1d.weight"));
+            // Load conv1d weights and transpose from [channels, 4] to [4, channels]
+            // for contiguous AVX-512 loads in the conv1d hot loop
+            {
+                auto raw = load_f32(pname("ssm_conv1d.weight"));
+                int channels = MC::ssm_conv_channels;
+                int kernel = MC::ssm_conv_kernel;
+                lw.ssm_conv1d_host.resize(raw.size());
+                for (int ch = 0; ch < channels; ch++)
+                    for (int k = 0; k < kernel; k++)
+                        lw.ssm_conv1d_host[k * channels + ch] = raw[ch * kernel + k];
+            }
             lw.ssm_dt_bias_host = load_f32(pname("ssm_dt.bias"));
             lw.ssm_norm_host = load_f32(pname("ssm_norm.weight"));
 
