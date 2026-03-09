@@ -4,12 +4,13 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 
 # Project structure
 
-- `tt_metal/host/engine.cpp` — inference engine: forward pass, `generate()`, `load_model_and_tokenizer()`
+- `tt_metal/host/engine.cpp` — inference engine (~3400 lines): forward pass, `generate()`, `load_model_and_tokenizer()`
 - `tt_metal/host/engine.h` — public API: `generate()`, `load_model_and_tokenizer()`, `reset_state()`, `shutdown()`, `get_tokenizer()`
 - `tt_metal/host/gguf_loader.{h,cpp}` — GGUF weight loading into device DRAM MeshBuffers
 - `tt_metal/host/model_config.h` — model hyperparameters and tile dimensions
-- `tt_metal/kernels/` — Tensix compute/dataflow kernels (currently unused, matmuls via ttnn API)
-- `tt_metal/tests/` — test suite (device, matmul, weight loading, forward pass)
+- `tt_metal/kernels/compute/` — Tensix compute kernels: `gemv.cpp`, `rmsnorm.cpp`, `eltwise_binary.cpp`, `swiglu.cpp`
+- `tt_metal/kernels/dataflow/` — data movement kernels: `reader_gemv_dram_sharded.cpp`, `writer_gemv.cpp`, `writer_gemv_split.cpp`, `writer_gemv_resadd.cpp`, `reader_binary_tiles_multicore.cpp`
+- `tt_metal/tests/` — test suite: `test_forward.cpp`, `test_device.cpp`, `test_matmul.cpp`, `test_load_weights.cpp`, `test_dram_bw.cpp`, `test_mesh_overhead.cpp`
 - `tt_metal/CMakeLists.txt` — CMake build system
 - `src/tokenizer.{h,cpp}` — BPE tokenizer (GPT-2 byte-level)
 - `src/download.{h,cpp}` — HuggingFace model download
@@ -28,7 +29,7 @@ Requires `sudo` and `TT_METAL_RUNTIME_ROOT`:
 
 ```sh
 sudo TT_METAL_RUNTIME_ROOT=/home/ubuntu/tt-metal \
-  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
+  ./build/test_forward /home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
 ## Reference model (llama.cpp)
