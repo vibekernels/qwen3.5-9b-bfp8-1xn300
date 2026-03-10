@@ -54,9 +54,9 @@ ENGINE_SRCS := src/engine.cpp src/gguf_loader.cpp src/tokenizer.cpp
 ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 
 # Targets
-.PHONY: all clean test quicktest setup
+.PHONY: all clean test quicktest setup chat
 
-all: $(BUILD)/test_forward $(BUILD)/test_inference
+all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat
 
 # Auto-setup: init submodule + build tt-metal if SDK not found
 $(TT_METAL_BUILD)/lib/libtt_metal.so:
@@ -86,6 +86,16 @@ $(BUILD)/test_forward: src/tests/test_forward.cpp $(BUILD)/libqwen_engine.a
 $(BUILD)/test_inference: src/tests/test_inference.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) src/tests/test_inference.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
+
+# Interactive chat CLI
+$(BUILD)/qwen-chat: src/chat.cpp $(BUILD)/libqwen_engine.a
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
+
+chat: $(BUILD)/qwen-chat
+	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+		$(BUILD)/qwen-chat \
+		$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} 2>/dev/null
 
 # Standalone test targets (link directly against tt-metal)
 $(BUILD)/test_matmul: src/tests/test_matmul.cpp
