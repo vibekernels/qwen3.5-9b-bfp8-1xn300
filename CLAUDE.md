@@ -38,7 +38,9 @@ Environment variables:
 ## Test inference
 
 ```sh
-TT_METAL_RUNTIME_ROOT=/home/ubuntu/tt-metal \
+make quicktest   # or: make test
+# Manual run:
+TT_METAL_RUNTIME_ROOT=third_party/tt-metal \
   ./build/test_forward /home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
