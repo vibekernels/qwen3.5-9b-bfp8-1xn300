@@ -2765,7 +2765,6 @@ static float* forward_prefill(const int* tokens, int N) {
             batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
                        g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
                        g_combined_rows, g_batch_proj.data());
-
             // Per-token SSM processing (sequential: conv1d + delta-net)
             for (int ti = 0; ti < N; ti++) {
                 float* proj = g_batch_proj.data() + (size_t)ti * g_combined_rows;
@@ -2888,12 +2887,10 @@ static float* forward_prefill(const int* tokens, int N) {
                        ssm_proj_in, MC::ssm_d_inner * sizeof(float));
                 // Zero-pad if ssm_d_inner < n_embd (they're equal for this model)
             }
-
             // Batch outproj GEMV: [N, ssm_d_inner] → [N, n_embd]
             batch_gemv(g_mesh.get(), g_batch_outproj.data(), N, MC::ssm_d_inner,
                        g_norm_dev_buf, g_wt.ssm_out_buf[ssm_idx],
                        MC::n_embd, g_batch_ffn_down.data());
-
             // Residual add on host
             for (int i = 0; i < N; i++)
                 for (int j = 0; j < MC::n_embd; j++)
@@ -2906,59 +2903,66 @@ static float* forward_prefill(const int* tokens, int N) {
                         norm_buf + (size_t)i * MC::n_embd, MC::n_embd);
 
             if (g_mesh1) {
-                // TP FFN: each chip processes half of n_ff
-                // Gate+up on chip 0
-                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
-                           g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf[ssm_idx],
-                           n_ff_tp * 2, g_batch_ffn_out.data());
-                // Gate+up on chip 1
+                // TP FFN: overlap chip 0 and chip 1 gate+up GEMVs
+                auto& cq1 = g_mesh1->mesh_command_queue();
+
+                // Write activations to both chips concurrently
+                write_batch_to_buf(g_norm_dev_buf, norm_buf, N, MC::n_embd, g_mesh.get());
                 write_batch_to_buf(g_norm_dev_buf_1, norm_buf, N, MC::n_embd, g_mesh1.get());
+
+                // Dispatch gate+up on both chips (non-blocking)
+                auto& gb0_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                              gb0_gu.out_buf, n_ff_tp * 2, MC::n_embd);
                 auto& gb1_gu = get_gemv_buf(g_mesh1.get(), n_ff_tp * 2, MC::n_embd);
                 dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
                               gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
-                auto& cq1 = g_mesh1->mesh_command_queue();
-                // Allocate temp for chip 1 gate_up output
+
+                // Read both results (blocking)
+                EnqueueReadMeshBuffer(cq0, gb0_gu.out_host_tiled, gb0_gu.out_buf, true);
+                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
+
+                // Untilize both
+                read_batch_from_tiles(gb0_gu.out_host_tiled.data(), g_batch_ffn_out.data(), N, n_ff_tp * 2);
                 static std::vector<float> batch_gu1;
                 if (batch_gu1.size() < (size_t)N * n_ff_tp * 2)
                     batch_gu1.resize((size_t)N * n_ff_tp * 2);
-                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
                 read_batch_from_tiles(gb1_gu.out_host_tiled.data(), batch_gu1.data(), N, n_ff_tp * 2);
 
-                // SwiGLU on each half, then down GEMV
-                // Chip 0 half: gate[0..n_ff_tp-1], up[n_ff_tp..2*n_ff_tp-1]
-                for (int i = 0; i < N; i++) {
-                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
-                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
-                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
-                        __m512 vg = _mm512_loadu_ps(gu0 + j);
-                        __m512 vu = _mm512_loadu_ps(gu0 + n_ff_tp + j);
-                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
-                    }
-                }
-                // Down GEMV chip 0: [N, n_ff_tp] → [N, n_embd]
-                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, n_ff_tp,
-                           g_tp_ffn_0.act_buf, g_wt.ssm_ffn_down_buf[ssm_idx],
-                           MC::n_embd, g_batch_ffn_down.data());
-
-                // Chip 1 half: SwiGLU
+                // SwiGLU on both halves
                 static std::vector<float> batch_act1;
                 if (batch_act1.size() < (size_t)N * n_ff_tp)
                     batch_act1.resize((size_t)N * n_ff_tp);
                 for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
                     float* gu1 = batch_gu1.data() + (size_t)i * n_ff_tp * 2;
                     float* act1 = batch_act1.data() + (size_t)i * n_ff_tp;
                     for (uint32_t j = 0; j < n_ff_tp; j += 16) {
-                        __m512 vg = _mm512_loadu_ps(gu1 + j);
-                        __m512 vu = _mm512_loadu_ps(gu1 + n_ff_tp + j);
-                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                        __m512 vg0 = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu0 = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg0), vu0));
+                        __m512 vg1 = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu1 = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg1), vu1));
                     }
                 }
-                // Down GEMV chip 1: [N, n_ff_tp] → [N, n_embd]
+
+                // Overlap chip 0 and chip 1 down GEMVs
+                write_batch_to_buf(g_tp_ffn_0.act_buf, g_batch_ffn_act.data(), N, n_ff_tp, g_mesh.get());
                 write_batch_to_buf(g_tp_ffn_1.act_buf, batch_act1.data(), N, n_ff_tp, g_mesh1.get());
+
+                auto& gb0_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_0.act_buf, g_wt.ssm_ffn_down_buf[ssm_idx],
+                              gb0_down.out_buf, MC::n_embd, n_ff_tp);
                 auto& gb1_down = get_gemv_buf(g_mesh1.get(), MC::n_embd, n_ff_tp);
                 dispatch_gemv(g_mesh1.get(), g_tp_ffn_1.act_buf, g_wt.ssm_ffn_down_buf_1[ssm_idx],
                               gb1_down.out_buf, MC::n_embd, n_ff_tp);
+
+                EnqueueReadMeshBuffer(cq0, gb0_down.out_host_tiled, gb0_down.out_buf, true);
                 EnqueueReadMeshBuffer(cq1, gb1_down.out_host_tiled, gb1_down.out_buf, true);
+
+                read_batch_from_tiles(gb0_down.out_host_tiled.data(), g_batch_ffn_down.data(), N, MC::n_embd);
                 read_batch_from_tiles(gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
 
                 // Residual add: hidden += down_chip0 + down_chip1
@@ -2991,7 +2995,6 @@ static float* forward_prefill(const int* tokens, int N) {
                     for (int j = 0; j < MC::n_embd; j++)
                         hidden[(size_t)i * MC::n_embd + j] += g_batch_ffn_down[(size_t)i * MC::n_embd + j];
             }
-
             ssm_idx++;
         } else {
             // ======== Full Attention Layer ========
@@ -3109,51 +3112,62 @@ static float* forward_prefill(const int* tokens, int N) {
                         norm_buf + (size_t)i * MC::n_embd, MC::n_embd);
 
             if (g_mesh1) {
-                // TP FFN (same structure as SSM TP FFN above)
-                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
-                           g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
-                           n_ff_tp * 2, g_batch_ffn_out.data());
+                // TP FFN: overlap chip 0 and chip 1 gate+up GEMVs
+                auto& cq1 = g_mesh1->mesh_command_queue();
+
+                write_batch_to_buf(g_norm_dev_buf, norm_buf, N, MC::n_embd, g_mesh.get());
                 write_batch_to_buf(g_norm_dev_buf_1, norm_buf, N, MC::n_embd, g_mesh1.get());
+
+                auto& gb0_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
+                              gb0_gu.out_buf, n_ff_tp * 2, MC::n_embd);
                 auto& gb1_gu = get_gemv_buf(g_mesh1.get(), n_ff_tp * 2, MC::n_embd);
                 dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.attn_ffn_gate_up_buf_1[attn_idx],
                               gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
-                auto& cq1 = g_mesh1->mesh_command_queue();
+
+                EnqueueReadMeshBuffer(cq0, gb0_gu.out_host_tiled, gb0_gu.out_buf, true);
+                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
+
+                read_batch_from_tiles(gb0_gu.out_host_tiled.data(), g_batch_ffn_out.data(), N, n_ff_tp * 2);
                 static std::vector<float> batch_gu1_attn;
                 if (batch_gu1_attn.size() < (size_t)N * n_ff_tp * 2)
                     batch_gu1_attn.resize((size_t)N * n_ff_tp * 2);
-                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
                 read_batch_from_tiles(gb1_gu.out_host_tiled.data(), batch_gu1_attn.data(), N, n_ff_tp * 2);
 
-                for (int i = 0; i < N; i++) {
-                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
-                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
-                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
-                        __m512 vg = _mm512_loadu_ps(gu0 + j);
-                        __m512 vu = _mm512_loadu_ps(gu0 + n_ff_tp + j);
-                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
-                    }
-                }
-                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, n_ff_tp,
-                           g_tp_ffn_0.act_buf, g_wt.attn_ffn_down_buf[attn_idx],
-                           MC::n_embd, g_batch_ffn_down.data());
-
+                // SwiGLU on both halves
                 static std::vector<float> batch_act1_attn;
                 if (batch_act1_attn.size() < (size_t)N * n_ff_tp)
                     batch_act1_attn.resize((size_t)N * n_ff_tp);
                 for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
                     float* gu1 = batch_gu1_attn.data() + (size_t)i * n_ff_tp * 2;
                     float* act1 = batch_act1_attn.data() + (size_t)i * n_ff_tp;
                     for (uint32_t j = 0; j < n_ff_tp; j += 16) {
-                        __m512 vg = _mm512_loadu_ps(gu1 + j);
-                        __m512 vu = _mm512_loadu_ps(gu1 + n_ff_tp + j);
-                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                        __m512 vg0 = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu0 = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg0), vu0));
+                        __m512 vg1 = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu1 = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg1), vu1));
                     }
                 }
+
+                // Overlap chip 0 and chip 1 down GEMVs
+                write_batch_to_buf(g_tp_ffn_0.act_buf, g_batch_ffn_act.data(), N, n_ff_tp, g_mesh.get());
                 write_batch_to_buf(g_tp_ffn_1.act_buf, batch_act1_attn.data(), N, n_ff_tp, g_mesh1.get());
+
+                auto& gb0_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_0.act_buf, g_wt.attn_ffn_down_buf[attn_idx],
+                              gb0_down.out_buf, MC::n_embd, n_ff_tp);
                 auto& gb1_down = get_gemv_buf(g_mesh1.get(), MC::n_embd, n_ff_tp);
                 dispatch_gemv(g_mesh1.get(), g_tp_ffn_1.act_buf, g_wt.attn_ffn_down_buf_1[attn_idx],
                               gb1_down.out_buf, MC::n_embd, n_ff_tp);
+
+                EnqueueReadMeshBuffer(cq0, gb0_down.out_host_tiled, gb0_down.out_buf, true);
                 EnqueueReadMeshBuffer(cq1, gb1_down.out_host_tiled, gb1_down.out_buf, true);
+
+                read_batch_from_tiles(gb0_down.out_host_tiled.data(), g_batch_ffn_down.data(), N, MC::n_embd);
                 read_batch_from_tiles(gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
 
                 for (int i = 0; i < N; i++)
