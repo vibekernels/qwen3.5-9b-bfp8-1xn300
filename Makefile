@@ -1,8 +1,8 @@
 # Qwen 3.5-9B inference on Tenstorrent N300
 # Usage:
 #   make                  — build everything
-#   make test             — run integration tests (needs sudo)
-#   make test_forward     — build forward pass test only
+#   make quicktest        — smoke test: "The capital of France is" (needs sudo)
+#   make test             — run full integration tests (needs sudo)
 #   make clean            — remove build artifacts
 #
 # Environment:
@@ -52,7 +52,7 @@ ENGINE_SRCS := src/engine.cpp src/gguf_loader.cpp src/tokenizer.cpp
 ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 
 # Targets
-.PHONY: all clean test
+.PHONY: all clean test quicktest
 
 all: $(BUILD)/test_forward $(BUILD)/test_inference
 
@@ -90,6 +90,13 @@ $(BUILD)/test_dram_bw: tests/test_dram_bw.cpp
 $(BUILD)/test_mesh_overhead: tests/test_mesh_overhead.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(TT_LIBS)
+
+# Quick smoke test: "The capital of France is" → should output "Paris"
+quicktest: $(BUILD)/test_forward
+	@sudo env TT_METAL_RUNTIME_ROOT=$(TT_METAL_HOME) QUIET=1 \
+		$(BUILD)/test_forward \
+		$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} \
+		"The capital of France is" 16 --raw 2>/dev/null
 
 # Run integration test suite
 test: $(BUILD)/test_inference
