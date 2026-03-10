@@ -56,23 +56,25 @@ ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 # Targets
 .PHONY: all clean test quicktest setup
 
-# First-time setup: init submodule + build tt-metal
-setup:
+all: $(BUILD)/test_forward $(BUILD)/test_inference
+
+# Auto-setup: init submodule + build tt-metal if SDK not found
+$(TT_METAL_BUILD)/lib/libtt_metal.so:
 	git submodule update --init --depth 1
 	cd $(TT_METAL_HOME) && ./build_metal.sh
 
-all: $(BUILD)/test_forward $(BUILD)/test_inference
+setup: $(TT_METAL_BUILD)/lib/libtt_metal.so
 
 # Engine static library
 $(BUILD)/libqwen_engine.a: $(ENGINE_OBJS)
 	@mkdir -p $(@D)
 	ar rcs $@ $^
 
-$(BUILD)/src/engine.o: src/engine.cpp
+$(BUILD)/src/engine.o: src/engine.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
 	@mkdir -p $(@D)
 	$(CXX) $(ENGINE_CXXFLAGS) -c $< -o $@
 
-$(BUILD)/src/%.o: src/%.cpp
+$(BUILD)/src/%.o: src/%.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
