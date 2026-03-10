@@ -2599,6 +2599,631 @@ static void apply_rope_cached(float* head, int pos) {
 }
 
 // ============================================================================
+// Batched prefill: process N tokens (N<=32) through all layers using batch GEMV.
+// Reads weights once per batch instead of once per token — big bandwidth win.
+// Host-side RMSNorm, SwiGLU, residual add; SSM/attention still per-token.
+// ============================================================================
+static constexpr int PREFILL_BATCH = 32;
+
+// Scratch buffers for batch prefill (allocated on first use)
+static std::vector<float> g_batch_hidden;     // [32, n_embd]
+static std::vector<float> g_batch_norm;       // [32, n_embd]
+static std::vector<float> g_batch_proj;       // [32, max(combined_rows, qkv_rows)]
+static std::vector<float> g_batch_outproj;    // [32, n_embd]
+static std::vector<float> g_batch_ffn_out;    // [32, 2*n_ff or 2*n_ff_tp]
+static std::vector<float> g_batch_ffn_act;    // [32, n_ff or n_ff_tp]
+static std::vector<float> g_batch_ffn_down;   // [32, n_embd]
+static std::vector<float> g_batch_ffn_down1;  // [32, n_embd] (chip 1 partial for TP)
+static std::vector<bfloat16> g_batch_tiled;   // staging buffer for batch PCIe transfers
+static bool g_prefill_bufs_inited = false;
+
+static void init_prefill_bufs() {
+    if (g_prefill_bufs_inited) return;
+    int max_proj = std::max(g_combined_rows, g_qkv_rows);
+    g_batch_hidden.resize(PREFILL_BATCH * MC::n_embd);
+    g_batch_norm.resize(PREFILL_BATCH * MC::n_embd);
+    g_batch_proj.resize(PREFILL_BATCH * max_proj);
+    g_batch_outproj.resize(PREFILL_BATCH * MC::n_embd);
+    int ffn_dim = g_mesh1 ? (int)n_ff_tp : MC::n_ff;
+    g_batch_ffn_out.resize(PREFILL_BATCH * 2 * ffn_dim);
+    g_batch_ffn_act.resize(PREFILL_BATCH * ffn_dim);
+    g_batch_ffn_down.resize(PREFILL_BATCH * MC::n_embd);
+    if (g_mesh1) g_batch_ffn_down1.resize(PREFILL_BATCH * MC::n_embd);
+    g_prefill_bufs_inited = true;
+}
+
+// Write [N, dim] row-major f32 data into tiled BF16 format on device.
+// N <= 32. Fills all N rows of each 32x32 tile.
+static void write_batch_to_buf(std::shared_ptr<MeshBuffer> buf,
+                                const float* data, int N, uint32_t dim,
+                                MeshDevice* device = nullptr) {
+    auto& cq = (device ? device : g_mesh.get())->mesh_command_queue();
+    uint32_t dim_padded = ((dim + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
+    uint32_t num_tile_cols = dim_padded / TILE_WIDTH;
+    size_t needed = (size_t)num_tile_cols * TILE_HEIGHT * TILE_WIDTH;
+    if (g_batch_tiled.size() < needed)
+        g_batch_tiled.resize(needed);
+    memset(g_batch_tiled.data(), 0, needed * sizeof(bfloat16));
+
+    uint16_t* ht = reinterpret_cast<uint16_t*>(g_batch_tiled.data());
+
+    for (int r = 0; r < N; r++) {
+        const uint32_t* row_bits = reinterpret_cast<const uint32_t*>(data + (size_t)r * dim);
+        // Face layout: rows 0-15 → faces 0,2 (offsets 0, 256)
+        //              rows 16-31 → faces 1,3 (offsets 512, 768)
+        uint32_t face_base_lo = (r < 16) ? 0 : 512;       // face 0 or 1
+        uint32_t face_base_hi = face_base_lo + 256;         // face 2 or 3
+        uint32_t row_off = (r % 16) * 16;
+
+        for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
+            uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+            uint32_t col_base = tc * TILE_WIDTH;
+            uint32_t pos0 = tile_off + face_base_lo + row_off;
+            uint32_t pos1 = tile_off + face_base_hi + row_off;
+
+            if (col_base + 32 <= dim) {
+                __m512i v0 = _mm512_loadu_si512(row_bits + col_base);
+                __m512i v1 = _mm512_loadu_si512(row_bits + col_base + 16);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + pos0),
+                                    _mm512_cvtepi32_epi16(_mm512_srli_epi32(v0, 16)));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + pos1),
+                                    _mm512_cvtepi32_epi16(_mm512_srli_epi32(v1, 16)));
+            } else {
+                for (uint32_t c = 0; c < 16 && col_base + c < dim; c++)
+                    ht[pos0 + c] = static_cast<uint16_t>(row_bits[col_base + c] >> 16);
+                for (uint32_t c = 0; c < 16 && col_base + 16 + c < dim; c++)
+                    ht[pos1 + c] = static_cast<uint16_t>(row_bits[col_base + 16 + c] >> 16);
+            }
+        }
+    }
+    EnqueueWriteMeshBuffer(cq, buf, g_batch_tiled, false);
+}
+
+// Read [N, dim] from tiled BF16 output tiles into row-major f32.
+// tiled_data is the host-side copy of the output buffer.
+static void read_batch_from_tiles(const bfloat16* tiled_data, float* out,
+                                   int N, uint32_t dim) {
+    uint32_t dim_padded = ((dim + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
+    uint32_t num_tile_cols = dim_padded / TILE_WIDTH;
+    const uint16_t* ht = reinterpret_cast<const uint16_t*>(tiled_data);
+
+    for (int r = 0; r < N; r++) {
+        uint32_t* row_bits = reinterpret_cast<uint32_t*>(out + (size_t)r * dim);
+        uint32_t face_base_lo = (r < 16) ? 0 : 512;
+        uint32_t face_base_hi = face_base_lo + 256;
+        uint32_t row_off = (r % 16) * 16;
+
+        for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
+            uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+            uint32_t col_base = tc * TILE_WIDTH;
+            uint32_t pos0 = tile_off + face_base_lo + row_off;
+            uint32_t pos1 = tile_off + face_base_hi + row_off;
+
+            if (col_base + 32 <= dim) {
+                __m256i f0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ht + pos0));
+                __m256i f1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ht + pos1));
+                _mm512_storeu_si512(row_bits + col_base,
+                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(f0), 16));
+                _mm512_storeu_si512(row_bits + col_base + 16,
+                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(f1), 16));
+            } else {
+                for (uint32_t c = 0; c < 16 && col_base + c < dim; c++)
+                    row_bits[col_base + c] = static_cast<uint32_t>(ht[pos0 + c]) << 16;
+                for (uint32_t c = 0; c < 16 && col_base + 16 + c < dim; c++)
+                    row_bits[col_base + 16 + c] = static_cast<uint32_t>(ht[pos1 + c]) << 16;
+            }
+        }
+    }
+}
+
+// Batch GEMV helper: write batch activation → dispatch_gemv → read batch output.
+// Returns pointer to output in out_buf (caller provides host staging).
+static void batch_gemv(MeshDevice* device,
+                        const float* act, int N, uint32_t K,
+                        std::shared_ptr<MeshBuffer> act_dev_buf,
+                        std::shared_ptr<MeshBuffer> weight_buf,
+                        uint32_t M,
+                        float* out_host) {
+    write_batch_to_buf(act_dev_buf, act, N, K, device);
+    auto& gb = get_gemv_buf(device, M, K);
+    dispatch_gemv(device, act_dev_buf, weight_buf, gb.out_buf, M, K);
+    auto& cq = device->mesh_command_queue();
+    EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
+    read_batch_from_tiles(gb.out_host_tiled.data(), out_host, N, M);
+}
+
+// Forward prefill: process N tokens (N<=32) through all 32 layers.
+// Updates g_pos, SSM state, KV caches. Returns logits for last token.
+static float* forward_prefill(const int* tokens, int N) {
+    init_prefill_bufs();
+    auto& cq0 = g_mesh->mesh_command_queue();
+
+    // 1. Embed all tokens
+    for (int i = 0; i < N; i++) {
+        const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)tokens[i] * MC::n_embd;
+        uint32_t* hbits = reinterpret_cast<uint32_t*>(g_batch_hidden.data() + (size_t)i * MC::n_embd);
+        for (int j = 0; j < MC::n_embd; j++)
+            hbits[j] = static_cast<uint32_t>(emb[j]) << 16;
+    }
+
+    int attn_idx = 0, ssm_idx = 0;
+    for (int layer = 0; layer < MC::n_layers; layer++) {
+        float* hidden = g_batch_hidden.data();
+        float* norm_buf = g_batch_norm.data();
+
+        // Host RMSNorm for all N tokens
+        const float* norm_w = g_layer_norms[layer].attn_norm.data();
+        for (int i = 0; i < N; i++)
+            rmsnorm(hidden + (size_t)i * MC::n_embd, norm_w,
+                    norm_buf + (size_t)i * MC::n_embd, MC::n_embd);
+
+        if (MC::is_recurrent(layer)) {
+            // ======== SSM (Delta-Net) Layer ========
+            auto& lw = g_model.ssm_layers[ssm_idx];
+
+            // Batch combined projection GEMV
+            batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                       g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
+                       g_combined_rows, g_batch_proj.data());
+
+            // Per-token SSM processing (sequential: conv1d + delta-net)
+            for (int ti = 0; ti < N; ti++) {
+                float* proj = g_batch_proj.data() + (size_t)ti * g_combined_rows;
+                float* qkv_raw = proj;
+                float* z_raw = proj + MC::ssm_conv_channels;
+                float* alpha_raw = z_raw + MC::ssm_d_inner;
+                float* beta_raw = alpha_raw + MC::ssm_dt_rank;
+
+                // Conv1d + SiLU
+                auto& cs = g_conv_state[ssm_idx];
+                float* conv_out = g_conv_out.data();
+                const float* w = lw.ssm_conv1d_host.data();
+                constexpr int C = MC::ssm_conv_channels;
+                const float* s0 = cs.data();
+                const float* s1 = cs.data() + C;
+                const float* s2 = cs.data() + 2 * C;
+                for (int ch = 0; ch < C; ch += 16) {
+                    __m512 vw0 = _mm512_loadu_ps(w + ch);
+                    __m512 vw1 = _mm512_loadu_ps(w + C + ch);
+                    __m512 vw2 = _mm512_loadu_ps(w + 2 * C + ch);
+                    __m512 vw3 = _mm512_loadu_ps(w + 3 * C + ch);
+                    __m512 vsum = _mm512_mul_ps(_mm512_loadu_ps(s0 + ch), vw0);
+                    vsum = _mm512_fmadd_ps(_mm512_loadu_ps(s1 + ch), vw1, vsum);
+                    vsum = _mm512_fmadd_ps(_mm512_loadu_ps(s2 + ch), vw2, vsum);
+                    vsum = _mm512_fmadd_ps(_mm512_loadu_ps(qkv_raw + ch), vw3, vsum);
+                    _mm512_storeu_ps(conv_out + ch, fast_silu_avx512(vsum));
+                }
+                memcpy(cs.data(), s1, C * sizeof(float));
+                memcpy(cs.data() + C, s2, C * sizeof(float));
+                memcpy(cs.data() + 2 * C, qkv_raw, C * sizeof(float));
+
+                // Split conv output: Q | K | V
+                constexpr int num_k_heads = MC::ssm_n_group;
+                constexpr int head_k = MC::ssm_d_state;
+                constexpr int num_v = ssm_n_v_heads;
+                constexpr int head_v = ssm_head_v_dim_c;
+                float* conv_q = conv_out;
+                float* conv_k = conv_out + num_k_heads * head_k;
+                float* conv_v = conv_out + 2 * num_k_heads * head_k;
+
+                // Delta-net recurrence + gated RMSNorm
+                auto& state = g_ssm_state[ssm_idx];
+                float* ssm_proj_in = g_ssm_proj_in.data();
+                constexpr float ssm_scale = 1.0f / 11.3137f;
+
+                for (int vh = 0; vh < num_v; vh++) {
+                    int kh = vh % num_k_heads;
+                    alignas(64) float q[head_k], k_vec[head_k], v_vec[head_v];
+                    memcpy(q, conv_q + kh * head_k, head_k * sizeof(float));
+                    memcpy(k_vec, conv_k + kh * head_k, head_k * sizeof(float));
+                    memcpy(v_vec, conv_v + vh * head_v, head_v * sizeof(float));
+
+                    // RMSNorm Q and K
+                    __m512 vqn = _mm512_setzero_ps(), vkn = _mm512_setzero_ps();
+                    for (int d = 0; d < head_k; d += 16) {
+                        __m512 vq = _mm512_load_ps(q + d);
+                        __m512 vk = _mm512_load_ps(k_vec + d);
+                        vqn = _mm512_fmadd_ps(vq, vq, vqn);
+                        vkn = _mm512_fmadd_ps(vk, vk, vkn);
+                    }
+                    float qn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vqn) + MC::rms_norm_eps);
+                    float kn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vkn) + MC::rms_norm_eps);
+                    __m512 vqn_b = _mm512_set1_ps(qn_s);
+                    __m512 vkn_b = _mm512_set1_ps(kn_s);
+                    for (int d = 0; d < head_k; d += 16) {
+                        _mm512_store_ps(q + d, _mm512_mul_ps(_mm512_load_ps(q + d), vqn_b));
+                        _mm512_store_ps(k_vec + d, _mm512_mul_ps(_mm512_load_ps(k_vec + d), vkn_b));
+                    }
+
+                    float biased = alpha_raw[vh] + lw.ssm_dt_bias_host[vh];
+                    float sp = (biased > 20.0f) ? biased : logf(1.0f + fast_expf(biased));
+                    float gate_val = sp * lw.ssm_a_host[vh];
+                    float decay = expf(gate_val);
+                    float beta_val = fast_sigmoidf(beta_raw[vh]);
+                    float* sh = state.data() + vh * head_v * head_k;
+
+                    __m512 vdecay = _mm512_set1_ps(decay);
+                    for (int i = 0; i < head_v; i++) {
+                        float* row = sh + i * head_k;
+                        __m512 vsk = _mm512_setzero_ps();
+                        for (int j = 0; j < head_k; j += 16) {
+                            __m512 vr = _mm512_mul_ps(_mm512_loadu_ps(row + j), vdecay);
+                            _mm512_storeu_ps(row + j, vr);
+                            vsk = _mm512_fmadd_ps(vr, _mm512_load_ps(k_vec + j), vsk);
+                        }
+                        float sk = _mm512_reduce_add_ps(vsk);
+                        float dd = beta_val * (v_vec[i] - sk);
+                        __m512 vdd = _mm512_set1_ps(dd);
+                        __m512 vout_acc = _mm512_setzero_ps();
+                        for (int j = 0; j < head_k; j += 16) {
+                            __m512 vr = _mm512_loadu_ps(row + j);
+                            __m512 vk = _mm512_load_ps(k_vec + j);
+                            vr = _mm512_fmadd_ps(vk, vdd, vr);
+                            _mm512_storeu_ps(row + j, vr);
+                            vout_acc = _mm512_fmadd_ps(vr, _mm512_load_ps(q + j), vout_acc);
+                        }
+                        ssm_proj_in[vh * head_v + i] = _mm512_reduce_add_ps(vout_acc) * ssm_scale;
+                    }
+
+                    // Gated RMSNorm
+                    float* vo = ssm_proj_in + vh * head_v;
+                    __m512 vssq = _mm512_setzero_ps();
+                    for (int d = 0; d < head_v; d += 16) {
+                        __m512 vv = _mm512_loadu_ps(vo + d);
+                        vssq = _mm512_fmadd_ps(vv, vv, vssq);
+                    }
+                    float rms = 1.0f / sqrtf(_mm512_reduce_add_ps(vssq) / head_v + MC::rms_norm_eps);
+                    __m512 vrms = _mm512_set1_ps(rms);
+                    for (int d = 0; d < head_v; d += 16) {
+                        __m512 vv = _mm512_loadu_ps(vo + d);
+                        __m512 vnorm = _mm512_mul_ps(_mm512_mul_ps(vv, vrms),
+                                                      _mm512_loadu_ps(lw.ssm_norm_host.data() + d));
+                        __m512 vz = _mm512_loadu_ps(z_raw + vh * head_v + d);
+                        _mm512_storeu_ps(vo + d, _mm512_mul_ps(vnorm, fast_silu_avx512(vz)));
+                    }
+                }
+
+                // Store SSM output for this token into batch outproj buffer
+                memcpy(g_batch_outproj.data() + (size_t)ti * MC::n_embd,
+                       ssm_proj_in, MC::ssm_d_inner * sizeof(float));
+                // Zero-pad if ssm_d_inner < n_embd (they're equal for this model)
+            }
+
+            // Batch outproj GEMV: [N, ssm_d_inner] → [N, n_embd]
+            batch_gemv(g_mesh.get(), g_batch_outproj.data(), N, MC::ssm_d_inner,
+                       g_norm_dev_buf, g_wt.ssm_out_buf[ssm_idx],
+                       MC::n_embd, g_batch_ffn_down.data());
+
+            // Residual add on host
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < MC::n_embd; j++)
+                    hidden[(size_t)i * MC::n_embd + j] += g_batch_ffn_down[(size_t)i * MC::n_embd + j];
+
+            // FFN: norm → gate+up GEMV → SwiGLU → down GEMV → residual add
+            const float* post_norm_w = g_layer_norms[layer].post_norm.data();
+            for (int i = 0; i < N; i++)
+                rmsnorm(hidden + (size_t)i * MC::n_embd, post_norm_w,
+                        norm_buf + (size_t)i * MC::n_embd, MC::n_embd);
+
+            if (g_mesh1) {
+                // TP FFN: each chip processes half of n_ff
+                // Gate+up on chip 0
+                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                           g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                           n_ff_tp * 2, g_batch_ffn_out.data());
+                // Gate+up on chip 1
+                write_batch_to_buf(g_norm_dev_buf_1, norm_buf, N, MC::n_embd, g_mesh1.get());
+                auto& gb1_gu = get_gemv_buf(g_mesh1.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                              gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                auto& cq1 = g_mesh1->mesh_command_queue();
+                // Allocate temp for chip 1 gate_up output
+                static std::vector<float> batch_gu1;
+                if (batch_gu1.size() < (size_t)N * n_ff_tp * 2)
+                    batch_gu1.resize((size_t)N * n_ff_tp * 2);
+                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
+                read_batch_from_tiles(gb1_gu.out_host_tiled.data(), batch_gu1.data(), N, n_ff_tp * 2);
+
+                // SwiGLU on each half, then down GEMV
+                // Chip 0 half: gate[0..n_ff_tp-1], up[n_ff_tp..2*n_ff_tp-1]
+                for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                // Down GEMV chip 0: [N, n_ff_tp] → [N, n_embd]
+                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, n_ff_tp,
+                           g_tp_ffn_0.act_buf, g_wt.ssm_ffn_down_buf[ssm_idx],
+                           MC::n_embd, g_batch_ffn_down.data());
+
+                // Chip 1 half: SwiGLU
+                static std::vector<float> batch_act1;
+                if (batch_act1.size() < (size_t)N * n_ff_tp)
+                    batch_act1.resize((size_t)N * n_ff_tp);
+                for (int i = 0; i < N; i++) {
+                    float* gu1 = batch_gu1.data() + (size_t)i * n_ff_tp * 2;
+                    float* act1 = batch_act1.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                // Down GEMV chip 1: [N, n_ff_tp] → [N, n_embd]
+                write_batch_to_buf(g_tp_ffn_1.act_buf, batch_act1.data(), N, n_ff_tp, g_mesh1.get());
+                auto& gb1_down = get_gemv_buf(g_mesh1.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh1.get(), g_tp_ffn_1.act_buf, g_wt.ssm_ffn_down_buf_1[ssm_idx],
+                              gb1_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq1, gb1_down.out_host_tiled, gb1_down.out_buf, true);
+                read_batch_from_tiles(gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
+
+                // Residual add: hidden += down_chip0 + down_chip1
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] +=
+                            g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
+                            g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
+            } else {
+                // Non-TP FFN: full n_ff on chip 0
+                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                           g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                           MC::n_ff * 2, g_batch_ffn_out.data());
+                // SwiGLU
+                for (int i = 0; i < N; i++) {
+                    float* gu = g_batch_ffn_out.data() + (size_t)i * MC::n_ff * 2;
+                    float* act = g_batch_ffn_act.data() + (size_t)i * MC::n_ff;
+                    for (int j = 0; j < MC::n_ff; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu + j);
+                        __m512 vu = _mm512_loadu_ps(gu + MC::n_ff + j);
+                        _mm512_storeu_ps(act + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                // Down GEMV
+                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, MC::n_ff,
+                           get_ffn_buf(g_mesh.get()).act_buf, g_wt.ssm_ffn_down_buf[ssm_idx],
+                           MC::n_embd, g_batch_ffn_down.data());
+                // Residual add
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] += g_batch_ffn_down[(size_t)i * MC::n_embd + j];
+            }
+
+            ssm_idx++;
+        } else {
+            // ======== Full Attention Layer ========
+            auto& lw = g_model.attn_layers[attn_idx];
+            auto& aw = g_attn_small[attn_idx];
+
+            // Batch QKV projection GEMV
+            batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                       g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
+                       g_qkv_rows, g_batch_proj.data());
+
+            // Per-token attention processing
+            for (int ti = 0; ti < N; ti++) {
+                int pos = g_pos + ti;
+                float* qkv = g_batch_proj.data() + (size_t)ti * g_qkv_rows;
+
+                // Deinterleave Q and gate
+                constexpr int q_dim = MC::n_head * MC::head_dim * 2;
+                constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
+                float* q_heads = g_q_heads.data();
+                float* gate_heads = g_gate_heads.data();
+                for (int h = 0; h < MC::n_head; h++) {
+                    for (int d = 0; d < MC::head_dim; d++) {
+                        q_heads[h * MC::head_dim + d] = qkv[h * MC::head_dim * 2 + d];
+                        gate_heads[h * MC::head_dim + d] = qkv[h * MC::head_dim * 2 + MC::head_dim + d];
+                    }
+                }
+                float* k_proj = qkv + q_dim;
+                float* v_proj = k_proj + kv_dim_one;
+
+                // Per-head Q/K RMSNorm
+                for (int h = 0; h < MC::n_head; h++) {
+                    float* qh = q_heads + h * MC::head_dim;
+                    float ss = 0;
+                    for (int d = 0; d < MC::head_dim; d++) ss += qh[d] * qh[d];
+                    float rms_val = 1.0f / sqrtf(ss / MC::head_dim + MC::rms_norm_eps);
+                    for (int d = 0; d < MC::head_dim; d++)
+                        qh[d] = qh[d] * rms_val * aw.q_norm[d];
+                }
+                for (int h = 0; h < MC::n_head_kv; h++) {
+                    float* kh = k_proj + h * MC::head_dim;
+                    float ss = 0;
+                    for (int d = 0; d < MC::head_dim; d++) ss += kh[d] * kh[d];
+                    float rms_val = 1.0f / sqrtf(ss / MC::head_dim + MC::rms_norm_eps);
+                    for (int d = 0; d < MC::head_dim; d++)
+                        kh[d] = kh[d] * rms_val * aw.k_norm[d];
+                }
+
+                // RoPE
+                for (int h = 0; h < MC::n_head; h++)
+                    apply_rope_cached(q_heads + h * MC::head_dim, pos);
+                for (int h = 0; h < MC::n_head_kv; h++)
+                    apply_rope_cached(k_proj + h * MC::head_dim, pos);
+
+                // KV cache
+                memcpy(g_k_cache[attn_idx].data() + (size_t)pos * kv_dim,
+                       k_proj, kv_dim * sizeof(float));
+                memcpy(g_v_cache[attn_idx].data() + (size_t)pos * kv_dim,
+                       v_proj, kv_dim * sizeof(float));
+                int kv_len = pos + 1;
+
+                // Attention (online softmax) + sigmoid gating
+                float* attn_out = g_attn_out.data();
+                for (int h = 0; h < MC::n_head; h++) {
+                    int kv_h = h / (MC::n_head / MC::n_head_kv);
+                    float* qh = q_heads + h * MC::head_dim;
+                    float* out = attn_out + h * MC::head_dim;
+                    alignas(64) float acc[MC::head_dim];
+                    memset(acc, 0, MC::head_dim * sizeof(float));
+                    float max_score = -FLT_MAX, sum_exp = 0;
+                    for (int kp = 0; kp < kv_len; kp++) {
+                        float* kh = g_k_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
+                        __m512 vdot = _mm512_setzero_ps();
+                        for (int d = 0; d < MC::head_dim; d += 16)
+                            vdot = _mm512_fmadd_ps(_mm512_loadu_ps(qh + d), _mm512_loadu_ps(kh + d), vdot);
+                        float score = _mm512_reduce_add_ps(vdot) * MC::attn_scale;
+                        float new_max = std::max(max_score, score);
+                        float exp_s = expf(score - new_max);
+                        float corr = expf(max_score - new_max);
+                        sum_exp = sum_exp * corr + exp_s;
+                        float* vh = g_v_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
+                        __m512 vcorr = _mm512_set1_ps(corr);
+                        __m512 vexp = _mm512_set1_ps(exp_s);
+                        for (int d = 0; d < MC::head_dim; d += 16) {
+                            __m512 va = _mm512_load_ps(acc + d);
+                            va = _mm512_fmadd_ps(vexp, _mm512_loadu_ps(vh + d), _mm512_mul_ps(va, vcorr));
+                            _mm512_store_ps(acc + d, va);
+                        }
+                        max_score = new_max;
+                    }
+                    float* gh = gate_heads + h * MC::head_dim;
+                    for (int d = 0; d < MC::head_dim; d++)
+                        out[d] = (acc[d] / sum_exp) * fast_sigmoidf(gh[d]);
+                }
+
+                // Store attention output for this token
+                memcpy(g_batch_outproj.data() + (size_t)ti * MC::n_embd,
+                       attn_out, MC::n_head * MC::head_dim * sizeof(float));
+            }
+
+            // Batch outproj GEMV: [N, n_head*head_dim] → [N, n_embd]
+            batch_gemv(g_mesh.get(), g_batch_outproj.data(), N, MC::n_head * MC::head_dim,
+                       g_norm_dev_buf, g_wt.attn_wo_buf[attn_idx],
+                       MC::n_embd, g_batch_ffn_down.data());
+
+            // Residual add
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < MC::n_embd; j++)
+                    hidden[(size_t)i * MC::n_embd + j] += g_batch_ffn_down[(size_t)i * MC::n_embd + j];
+
+            // FFN: norm → gate+up → SwiGLU → down → residual
+            const float* post_norm_w = g_layer_norms[layer].post_norm.data();
+            for (int i = 0; i < N; i++)
+                rmsnorm(hidden + (size_t)i * MC::n_embd, post_norm_w,
+                        norm_buf + (size_t)i * MC::n_embd, MC::n_embd);
+
+            if (g_mesh1) {
+                // TP FFN (same structure as SSM TP FFN above)
+                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                           g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
+                           n_ff_tp * 2, g_batch_ffn_out.data());
+                write_batch_to_buf(g_norm_dev_buf_1, norm_buf, N, MC::n_embd, g_mesh1.get());
+                auto& gb1_gu = get_gemv_buf(g_mesh1.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                              gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                auto& cq1 = g_mesh1->mesh_command_queue();
+                static std::vector<float> batch_gu1_attn;
+                if (batch_gu1_attn.size() < (size_t)N * n_ff_tp * 2)
+                    batch_gu1_attn.resize((size_t)N * n_ff_tp * 2);
+                EnqueueReadMeshBuffer(cq1, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
+                read_batch_from_tiles(gb1_gu.out_host_tiled.data(), batch_gu1_attn.data(), N, n_ff_tp * 2);
+
+                for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, n_ff_tp,
+                           g_tp_ffn_0.act_buf, g_wt.attn_ffn_down_buf[attn_idx],
+                           MC::n_embd, g_batch_ffn_down.data());
+
+                static std::vector<float> batch_act1_attn;
+                if (batch_act1_attn.size() < (size_t)N * n_ff_tp)
+                    batch_act1_attn.resize((size_t)N * n_ff_tp);
+                for (int i = 0; i < N; i++) {
+                    float* gu1 = batch_gu1_attn.data() + (size_t)i * n_ff_tp * 2;
+                    float* act1 = batch_act1_attn.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < n_ff_tp; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                write_batch_to_buf(g_tp_ffn_1.act_buf, batch_act1_attn.data(), N, n_ff_tp, g_mesh1.get());
+                auto& gb1_down = get_gemv_buf(g_mesh1.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh1.get(), g_tp_ffn_1.act_buf, g_wt.attn_ffn_down_buf_1[attn_idx],
+                              gb1_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq1, gb1_down.out_host_tiled, gb1_down.out_buf, true);
+                read_batch_from_tiles(gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
+
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] +=
+                            g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
+                            g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
+            } else {
+                batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
+                           g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
+                           MC::n_ff * 2, g_batch_ffn_out.data());
+                for (int i = 0; i < N; i++) {
+                    float* gu = g_batch_ffn_out.data() + (size_t)i * MC::n_ff * 2;
+                    float* act = g_batch_ffn_act.data() + (size_t)i * MC::n_ff;
+                    for (int j = 0; j < MC::n_ff; j += 16) {
+                        __m512 vg = _mm512_loadu_ps(gu + j);
+                        __m512 vu = _mm512_loadu_ps(gu + MC::n_ff + j);
+                        _mm512_storeu_ps(act + j, _mm512_mul_ps(fast_silu_avx512(vg), vu));
+                    }
+                }
+                batch_gemv(g_mesh.get(), g_batch_ffn_act.data(), N, MC::n_ff,
+                           get_ffn_buf(g_mesh.get()).act_buf, g_wt.attn_ffn_down_buf[attn_idx],
+                           MC::n_embd, g_batch_ffn_down.data());
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] += g_batch_ffn_down[(size_t)i * MC::n_embd + j];
+            }
+
+            attn_idx++;
+        }
+    }
+
+    // Copy last token's hidden state to g_hidden_f32 for subsequent decode
+    memcpy(g_hidden_f32.data(), g_batch_hidden.data() + (size_t)(N - 1) * MC::n_embd,
+           MC::n_embd * sizeof(float));
+    g_pos += N;
+
+    // LM head: output norm + GEMV for last token only (reuse single-token path)
+    rmsnorm(g_hidden_f32.data(), g_output_norm.data(), g_norm_out.data(), MC::n_embd);
+    write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
+
+    float* logits = g_logits.data();
+    if (g_mesh1) {
+        uint32_t M0 = g_wt.lm_head_Mt0 * TILE_HEIGHT;
+        uint32_t M1 = g_wt.lm_head_Mt1 * TILE_HEIGHT;
+        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd);
+        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd);
+        write_f32_to_buf(g_norm_dev_buf_1, g_norm_out.data(), MC::n_embd, g_mesh1.get());
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+        dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+        auto& cq1 = g_mesh1->mesh_command_queue();
+        g_chip1_writer.submit([&]{
+            EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
+        });
+        EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
+        g_chip1_writer.wait();
+        read_gemv_to_f32(gb_lm0, logits, M0);
+        read_gemv_to_f32(gb_lm1, logits + M0, M1);
+    } else {
+        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                      MC::n_vocab, MC::n_embd);
+        EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
+        read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
+    }
+
+    return logits;
+}
+
+// ============================================================================
 // Forward pass: single decode token
 // Large matmuls on device via custom GEMV kernels, small ops on host CPU.
 // Returns pointer to static g_logits buffer (valid until next call).
@@ -3429,22 +4054,35 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    // Process all prompt tokens
-    for (int i = 0; i < (int)tokens.size(); i++) {
-        int token = tokens[i];
-        if (g_verbose) printf("  [prefill token %d/%d: %d]\n", i + 1, (int)tokens.size(), token);
+    // Process prompt tokens in batches of PREFILL_BATCH (32) using batched GEMV.
+    // Reads weights once per batch instead of once per token.
+    {
+        int n_prompt = (int)tokens.size();
+        int offset = 0;
+        const float* logits = nullptr;
 
-        // Bulk bf16→f32 embedding lookup using raw bit ops
-        const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)token * MC::n_embd;
-        uint32_t* hbits = reinterpret_cast<uint32_t*>(g_hidden_f32.data());
-        for (int j = 0; j < MC::n_embd; j++)
-            hbits[j] = static_cast<uint32_t>(emb[j]) << 16;
+        while (offset < n_prompt) {
+            int batch = std::min(PREFILL_BATCH, n_prompt - offset);
+            if (g_verbose) printf("  [prefill batch %d..%d of %d]\n", offset, offset + batch - 1, n_prompt);
 
-        const float* logits = forward_decode();
-        g_pos++;
+            if (batch >= 2) {
+                // Batched prefill: process batch tokens in parallel GEMV
+                logits = forward_prefill(tokens.data() + offset, batch);
+            } else {
+                // Single token: use regular decode path
+                int token = tokens[offset];
+                const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)token * MC::n_embd;
+                uint32_t* hbits = reinterpret_cast<uint32_t*>(g_hidden_f32.data());
+                for (int j = 0; j < MC::n_embd; j++)
+                    hbits[j] = static_cast<uint32_t>(emb[j]) << 16;
+                logits = forward_decode();
+                g_pos++;
+            }
+            offset += batch;
+        }
 
-        // After last prompt token, sample first output
-        if (i == (int)tokens.size() - 1) {
+        // Sample first output token from last prefill logits
+        if (logits) {
             float max_l = -FLT_MAX;
             for (int v = 0; v < MC::n_vocab; v++) {
                 if (logits[v] > max_l) { max_l = logits[v]; next_token = v; }
