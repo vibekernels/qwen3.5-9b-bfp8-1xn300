@@ -13,7 +13,7 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 - `src/kernels/compute/` — Tensix compute kernels (gemv, rmsnorm, swiglu, etc.)
 - `src/kernels/dataflow/` — data movement kernels (readers/writers)
 - `src/tests/` — test suite (test_inference.cpp, test_forward.cpp, benchmarks)
-- `src/third_party/` — third-party headers (json.hpp)
+- `third_party/` — third-party headers (json.hpp) and tt-metal SDK (git submodule)
 - `third_party/tt-metal/` — TT-Metalium SDK (git submodule)
 
 ## First-time setup

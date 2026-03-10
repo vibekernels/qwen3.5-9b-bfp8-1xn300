@@ -43,7 +43,7 @@ TT_DEFINES := \
 	-DTRACY_TIMER_FALLBACK
 
 CXXFLAGS := -std=gnu++20 -Wno-int-to-pointer-cast -fno-omit-frame-pointer \
-	$(TT_DEFINES) $(TT_INCLUDES) -I src -I src/third_party \
+	$(TT_DEFINES) $(TT_INCLUDES) -I src -I third_party \
 	-DKERNEL_DIR=\"$(CURDIR)/src/kernels\"
 
 ENGINE_CXXFLAGS := $(CXXFLAGS) -march=native -ffast-math
