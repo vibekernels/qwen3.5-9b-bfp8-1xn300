@@ -4,51 +4,63 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install clang-20 and build dependencies
+# Install build dependencies (base image already has clang-20)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates curl make && \
-    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
-        tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null && \
-    echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" \
-        > /etc/apt/sources.list.d/llvm-20.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends clang-20 && \
+    apt-get install -y --no-install-recommends curl make && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Set up SDK shim from pre-installed tt-metalium.
-# The base image has the SDK installed system-wide. We create a symlink tree
-# that matches the directory layout our Makefile expects:
-#   TT_METAL_BUILD/{include,lib,libexec}
-#   TT_METAL_HOME/tt_metal/impl/data_format
-RUN TT_SDK=/app/tt-sdk && \
-    mkdir -p $TT_SDK/build_Release/lib $TT_SDK/tt_metal/impl/data_format && \
-    ln -sf /usr/include $TT_SDK/build_Release/include && \
-    mkdir -p $TT_SDK/build_Release/libexec && \
-    ln -sf /usr/libexec/tt-metalium $TT_SDK/build_Release/libexec/tt-metalium && \
-    for lib in libtt_metal.so libtracy.so libdevice.so libtt_stl.so libspdlog.a; do \
-        src=$(find /usr/lib -name "${lib}*" \( -type f -o -type l \) 2>/dev/null | head -1); \
-        if [ -n "$src" ]; then \
-            ln -sf "$src" $TT_SDK/build_Release/lib/$lib; \
-            case "$lib" in libtracy.so) \
-                versioned=$(find /usr/lib -name "libtracy.so.0*" \( -type f -o -type l \) 2>/dev/null | head -1); \
-                if [ -n "$versioned" ]; then \
-                    ln -sf "$versioned" $TT_SDK/build_Release/lib/$(basename "$versioned"); \
-                fi ;; \
-            esac; \
-        fi; \
+# Discover the pre-installed tt-metalium SDK and create a symlink tree
+# matching the layout our Makefile expects (TT_METAL_BUILD/{include,lib,libexec}).
+RUN set -e && TT_SDK=/app/tt-sdk && \
+    mkdir -p $TT_SDK/build_Release/lib $TT_SDK/build_Release/libexec \
+             $TT_SDK/tt_metal/impl/data_format && \
+    echo "=== Discovering tt-metalium SDK ===" && \
+    echo "--- libtt_metal.so ---" && find / -name "libtt_metal.so" 2>/dev/null || true && \
+    echo "--- tt-metalium dirs ---" && find / -path "*/tt-metalium" -type d 2>/dev/null | head -10 || true && \
+    echo "--- tt_metal includes ---" && find / -path "*/include/tt-metalium" -type d 2>/dev/null | head -5 || true && \
+    echo "--- spdlog ---" && find / -name "libspdlog*" 2>/dev/null | head -5 || true && \
+    echo "--- tracy ---" && find / -name "libtracy*" 2>/dev/null | head -5 || true && \
+    # Symlink include dir \
+    INC_PARENT=$(dirname $(find / -path "*/include/tt-metalium" -type d 2>/dev/null | head -1) 2>/dev/null) && \
+    if [ -n "$INC_PARENT" ] && [ -d "$INC_PARENT" ]; then \
+        ln -sf "$INC_PARENT" $TT_SDK/build_Release/include; \
+    fi && \
+    # Symlink libexec/tt-metalium \
+    LIBEXEC=$(find / -path "*/libexec/tt-metalium" -type d 2>/dev/null | head -1) && \
+    if [ -n "$LIBEXEC" ] && [ -d "$LIBEXEC" ]; then \
+        ln -sf "$LIBEXEC" $TT_SDK/build_Release/libexec/tt-metalium; \
+    fi && \
+    # Symlink each required library (search everywhere) \
+    for lib in libtt_metal.so libdevice.so libtt_stl.so; do \
+        src=$(find / -name "$lib" \( -type f -o -type l \) 2>/dev/null | head -1); \
+        if [ -n "$src" ]; then ln -sf "$src" $TT_SDK/build_Release/lib/$lib; fi; \
     done && \
-    echo "=== SDK shim ===" && ls -la $TT_SDK/build_Release/lib/
+    # Tracy (version-specific soname) \
+    tracy=$(find / -name "libtracy.so*" \( -type f -o -type l \) 2>/dev/null | head -1); \
+    if [ -n "$tracy" ]; then \
+        ln -sf "$tracy" $TT_SDK/build_Release/lib/libtracy.so; \
+        ln -sf "$tracy" $TT_SDK/build_Release/lib/$(basename "$tracy"); \
+    fi && \
+    # spdlog (static or shared) \
+    spdlog=$(find / -name "libspdlog.a" -o -name "libspdlog.so" 2>/dev/null | head -1); \
+    if [ -n "$spdlog" ]; then \
+        ln -sf "$spdlog" $TT_SDK/build_Release/lib/$(basename "$spdlog"); \
+    fi && \
+    echo "=== SDK shim result ===" && ls -la $TT_SDK/build_Release/lib/ && \
+    ls -la $TT_SDK/build_Release/include/ 2>/dev/null || true
 
 # Copy project source
 COPY src/ src/
 COPY third_party/json.hpp third_party/json.hpp
 COPY Makefile .
 
-# Build using the pre-installed SDK
-RUN make -j$(nproc) \
+# Build using the pre-installed SDK.
+# Touch the libtt_metal.so target first so Make skips the auto-setup rule
+# (which tries git submodule update).
+RUN touch /app/tt-sdk/build_Release/lib/libtt_metal.so && \
+    make -j$(nproc) \
     TT_METAL_HOME=/app/tt-sdk \
     TT_METAL_BUILD=/app/tt-sdk/build_Release
 
