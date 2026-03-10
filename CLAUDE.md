@@ -26,7 +26,8 @@ make setup             # init tt-metal submodule + build SDK (~13 min)
 
 ```sh
 make -j$(nproc)        # build everything
-make test              # run integration tests
+make test              # run integration tests (~60s)
+make quicktest         # fast smoke test: "The capital of France is" → Paris
 make clean             # remove build artifacts
 ```
 
@@ -35,12 +36,34 @@ Environment variables:
 - `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
 - `MODEL_PATH` — path to .gguf model file
 
-## Test inference
+## Test suite details
+
+`make test` runs `test_inference` with 8 tests (ctx=128, ~60s total):
+
+- **test_basic_generation** — "1+1=" → expects "2" in output
+- **test_long_prompt** — ~50-token repeated prompt, verifies generation works
+- **test_prompt_exceeding_context** — prompt exceeding ctx=128, verifies graceful truncation
+- **test_emoji_in_output** — asks for emoji, validates UTF-8 output
+- **test_tok_per_sec** — 32-token decode, checks ≥5 tok/s (set `MIN_TOK_PER_SEC` to override)
+- **test_prefill_tok_per_sec** — ~50-token prefill benchmark, checks ≥5 prefill tok/s
+- **test_greedy_determinism** — two greedy runs produce identical output
+- **test_stop_on_eos** — chat prompt stops on EOS token
+
+Override test parameters via env vars:
+```sh
+TEST_CTX_SIZE=256 make test          # larger context (slower)
+LONG_PROMPT_REPEAT=20 make test      # longer prompt test
+DECODE_COUNT=64 make test            # more decode tokens for tok/s test
+MIN_TOK_PER_SEC=8 make test          # stricter performance threshold
+```
+
+## Manual inference
 
 ```sh
-make quicktest   # or: make test
+# Quick test:
+make quicktest
 # Manual run:
-TT_METAL_RUNTIME_ROOT=third_party/tt-metal \
+TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
   ./build/test_forward /home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
