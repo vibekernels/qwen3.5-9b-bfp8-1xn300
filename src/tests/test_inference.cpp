@@ -251,10 +251,10 @@ static void test_tok_per_sec() {
     auto t1 = std::chrono::high_resolution_clock::now();
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // Subtract estimated prefill time: prompt is ~30 tokens at ~120ms/tok
+    // Subtract estimated prefill time: prompt is ~20 tokens at ~35ms/tok (batched prefill)
     auto& tok = get_tokenizer();
     int n_prompt = (int)tok.encode(prompt).size();
-    double est_prefill_ms = n_prompt * 120.0;
+    double est_prefill_ms = n_prompt * 35.0;
     double decode_ms = ms - est_prefill_ms;
     if (decode_ms < 1.0) decode_ms = ms;  // fallback
     double tok_per_sec = (n > 0 && decode_ms > 0) ? n * 1000.0 / decode_ms : 0;

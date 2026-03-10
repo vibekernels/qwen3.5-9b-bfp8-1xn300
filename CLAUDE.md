@@ -67,6 +67,36 @@ TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
   ./build/test_forward /home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
+## Measuring decode speed
+
+The `test_tok_per_sec` test estimates decode tok/s by subtracting estimated prefill
+time from total generate() wall time. This estimate can be inaccurate — use
+`test_basic_generation` output instead for a reliable decode measurement:
+
+```
+test_basic_generation...
+  output (16 tok, 1922.6 ms, 8.3 tok/s): ...
+```
+
+That `8.3 tok/s` is total wall time (prefill + decode) ÷ tokens. With a very short
+prompt (4 tokens, ~300ms prefill), the number closely reflects true single-token
+decode speed. For a purer decode-only measurement, use a short prompt and many
+decode tokens:
+
+```sh
+TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal QUIET=1 \
+  ./build/test_forward "$MODEL_PATH" "1+1=" 64 --raw 2>/dev/null
+```
+
+Then compute: `(total_time - prefill_time) / decode_tokens`. The `[prefill: X ms]`
+line gives actual prefill time. Do NOT hardcode a ms/tok estimate for prefill
+subtraction — batched prefill (~33ms/tok) is very different from single-token
+(~120ms/tok), and short prompts don't batch well (~73ms/tok for <32 tokens).
+
+Current baselines (as of 2026-03-10):
+- **Decode**: ~8.4 tok/s (119ms/tok)
+- **Prefill**: ~30 tok/s (33ms/tok, batched)
+
 ## Reference model (llama.cpp)
 
 For comparison against llama.cpp:
