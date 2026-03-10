@@ -1448,6 +1448,10 @@ static bool g_ffn_chain_traces_valid_1[32] = {};
 static MeshTraceId g_norm_matmul_traces_1[32];
 static bool g_norm_matmul_traces_valid_1[32] = {};
 
+// Two-pass warmup: first forward pass warms all dispatch caches (no traces),
+// second pass captures traces (no new allocations, avoids allocator warning).
+static bool g_all_caches_warm = false;
+
 // Run rmsnorm on device + GEMV on device (no host round-trip for norm).
 // Hidden must already be on device in g_hidden_dev_buf.
 static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
@@ -2578,16 +2582,11 @@ static float* forward_decode() {
     write_hidden_to_device(g_hidden_f32.data());
 
     // One-time micro-benchmark: measure per-program overhead at decode 5
-    if (g_decode_count == 5) {
-        Finish(cq0);  // drain everything
-        auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
-
-        // Warmup: ensure cached
-        dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
-                             g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                      gb_test.out_buf, g_combined_rows, MC::n_embd);
+    // Only uses functions already warmed in the forward pass to avoid
+    // allocating new kernel binaries while traces are active.
+    if (g_decode_count == 5 && g_verbose) {
         Finish(cq0);
+        auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
 
         // Test 1: Time 10x single GEMV dispatch+Finish
         auto ta = Clock::now();
@@ -2599,45 +2598,7 @@ static float* forward_decode() {
         auto tb = Clock::now();
         double t_single = std::chrono::duration<double, std::milli>(tb - ta).count() / 10.0;
 
-        // Test 2: Time 10x Finish-only (already synced)
-        auto tc = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            Finish(cq0);
-        }
-        auto td = Clock::now();
-        double t_finish = std::chrono::duration<double, std::milli>(td - tc).count() / 10.0;
-
-        // Test 3: Time 10x (fused norm+GEMV + Finish)
-        auto te = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_gemv_fused_norm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
-                                     g_wt.ssm_w_combined_buf[0], gb_test.out_buf,
-                                     g_combined_rows, MC::n_embd, MC::n_embd);
-            Finish(cq0);
-        }
-        auto tf = Clock::now();
-        double t_norm_gemv = std::chrono::duration<double, std::milli>(tf - te).count() / 10.0;
-
-        // Test 4: Time 10x full FFN chain dispatch+Finish
-        // First ensure FFN chain trace is warm for layer 0
-        write_f32_to_buf(g_residual_dev_buf, g_hidden_f32.data(), MC::ssm_d_inner);
-        if (!g_ffn_chain_traces_valid[0]) {
-            outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
-                                  g_wt.post_norm_buf[0],
-                                  g_wt.ssm_ffn_gate_up_buf[0],
-                                  g_wt.ssm_ffn_down_buf[0]);
-            Finish(cq0);
-            auto tid = g_mesh->begin_mesh_trace(0);
-            outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
-                                  g_wt.post_norm_buf[0],
-                                  g_wt.ssm_ffn_gate_up_buf[0],
-                                  g_wt.ssm_ffn_down_buf[0]);
-            g_mesh->end_mesh_trace(0, tid);
-            g_ffn_chain_traces[0] = tid;
-            g_ffn_chain_traces_valid[0] = true;
-        }
-        Finish(cq0);
-
+        // Test 2: FFN chain trace replay
         auto tg = Clock::now();
         for (int r = 0; r < 10; r++) {
             g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[0], false);
@@ -2646,18 +2607,7 @@ static float* forward_decode() {
         auto th = Clock::now();
         double t_ffn_trace = std::chrono::duration<double, std::milli>(th - tg).count() / 10.0;
 
-        // Test 5: Time 10x pipelined GEMV (no Finish between)
-        auto ti = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-        }
-        Finish(cq0);
-        auto tj = Clock::now();
-        double t_pipelined = std::chrono::duration<double, std::milli>(tj - ti).count() / 10.0;
-
-        // Test 6: rmsnorm alone + Finish
-        Finish(cq0);
+        // Test 3: rmsnorm alone + Finish
         auto t6a = Clock::now();
         for (int r = 0; r < 10; r++) {
             dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
@@ -2667,71 +2617,10 @@ static float* forward_decode() {
         auto t6b = Clock::now();
         double t_norm_only = std::chrono::duration<double, std::milli>(t6b - t6a).count() / 10.0;
 
-        // Test 7: Two different GEMVs (different weight buffers) + Finish
-        Finish(cq0);
-        auto t7a = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[1],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-            Finish(cq0);
-        }
-        auto t7b = Clock::now();
-        double t_two_diff_gemv = std::chrono::duration<double, std::milli>(t7b - t7a).count() / 10.0;
-
-        // Test 8: Two same GEMVs + Finish (for comparison)
-        Finish(cq0);
-        auto t8a = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-            Finish(cq0);
-        }
-        auto t8b = Clock::now();
-        double t_two_same_gemv = std::chrono::duration<double, std::milli>(t8b - t8a).count() / 10.0;
-
-        // Test 9: eltwise add alone + Finish
-        Finish(cq0);
-        constexpr uint32_t embd_tiles_test = MC::n_embd / TILE_WIDTH;
-        auto t9a = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_eltwise_binary(g_mesh.get(), 0, g_hidden_dev_buf, gb_test.out_buf,
-                                    g_hidden_dev_buf, embd_tiles_test);
-            Finish(cq0);
-        }
-        auto t9b = Clock::now();
-        double t_eltwise = std::chrono::duration<double, std::milli>(t9b - t9a).count() / 10.0;
-
-        // Test 10: GEMV + eltwise + Finish
-        Finish(cq0);
-        auto t10a = Clock::now();
-        for (int r = 0; r < 10; r++) {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
-                          gb_test.out_buf, g_combined_rows, MC::n_embd);
-            dispatch_eltwise_binary(g_mesh.get(), 0, g_hidden_dev_buf, gb_test.out_buf,
-                                    g_hidden_dev_buf, embd_tiles_test);
-            Finish(cq0);
-        }
-        auto t10b = Clock::now();
-        double t_gemv_eltwise = std::chrono::duration<double, std::milli>(t10b - t10a).count() / 10.0;
-
         printf("=== Per-program overhead benchmark ===\n");
         printf("  Single GEMV + Finish:     %.3f ms\n", t_single);
-        printf("  Finish-only (no-op):      %.3f ms\n", t_finish);
-        printf("  norm+GEMV + Finish:       %.3f ms\n", t_norm_gemv);
         printf("  FFN chain trace + Finish: %.3f ms\n", t_ffn_trace);
-        printf("  Pipelined GEMV (10x):     %.3f ms/each\n", t_pipelined);
         printf("  rmsnorm alone + Finish:   %.3f ms\n", t_norm_only);
-        printf("  2x diff GEMV + Finish:    %.3f ms\n", t_two_diff_gemv);
-        printf("  2x same GEMV + Finish:    %.3f ms\n", t_two_same_gemv);
-        printf("  eltwise add + Finish:     %.3f ms\n", t_eltwise);
-        printf("  GEMV + eltwise + Finish:  %.3f ms\n", t_gemv_eltwise);
-        printf("  GEMV data: %.1f MB\n",
-               (double)(g_combined_rows * MC::n_embd) * 1.0625 / 1e6);
-
         fflush(stdout);
     }
 
@@ -2772,13 +2661,13 @@ static float* forward_decode() {
                 });
             }
 
-            // On-device rmsnorm + GEMV (traced after first use)
-            if (!g_norm_matmul_traces_valid[layer]) {
-                // First call: execute normally (creates cached workloads)
+            // On-device rmsnorm + GEMV (traced after caches warm)
+            if (g_norm_matmul_traces_valid[layer]) {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+            } else if (g_all_caches_warm) {
                 norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
                                 g_combined_rows, MC::n_embd);
                 Finish(cq0);
-                // Second call: capture trace
                 auto tid = g_mesh->begin_mesh_trace(0);
                 norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
                                 g_combined_rows, MC::n_embd);
@@ -2786,7 +2675,8 @@ static float* forward_decode() {
                 g_norm_matmul_traces[layer] = tid;
                 g_norm_matmul_traces_valid[layer] = true;
             } else {
-                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
+                                g_combined_rows, MC::n_embd);
             }
 
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
@@ -2945,7 +2835,12 @@ static float* forward_decode() {
             auto t2 = Clock::now();
             if (g_mesh1) {
                 // TP FFN: chip 0 + chip 1 traced independently
-                if (!g_ffn_chain_traces_valid[layer]) {
+                if (g_ffn_chain_traces_valid[layer] && g_ffn_chain_traces_valid_1[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
+                    g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else if (g_all_caches_warm) {
+                    // Capture chip 0 trace
                     outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf[layer],
                                               g_wt.ssm_ffn_gate_up_buf[ssm_idx],
@@ -2959,8 +2854,7 @@ static float* forward_decode() {
                     g_mesh->end_mesh_trace(0, tid0);
                     g_ffn_chain_traces[layer] = tid0;
                     g_ffn_chain_traces_valid[layer] = true;
-                }
-                if (!g_ffn_chain_traces_valid_1[layer]) {
+                    // Capture chip 1 trace
                     write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
                     outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf_1[layer],
@@ -2976,13 +2870,26 @@ static float* forward_decode() {
                     g_mesh1->end_mesh_trace(0, tid1);
                     g_ffn_chain_traces_1[layer] = tid1;
                     g_ffn_chain_traces_valid_1[layer] = true;
+                    // Replay both
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
+                    g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else {
+                    // Warmup only: execute without trace capture
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
+                    outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf_1[ssm_idx]);
                 }
-                // Replay traces
-                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
-                write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
-                g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
             } else {
-                if (!g_ffn_chain_traces_valid[layer]) {
+                if (g_ffn_chain_traces_valid[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                } else if (g_all_caches_warm) {
                     outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                           g_wt.post_norm_buf[layer],
                                           g_wt.ssm_ffn_gate_up_buf[ssm_idx],
@@ -2997,7 +2904,10 @@ static float* forward_decode() {
                     g_ffn_chain_traces[layer] = tid;
                     g_ffn_chain_traces_valid[layer] = true;
                 } else {
-                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                          g_wt.post_norm_buf[layer],
+                                          g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                          g_wt.ssm_ffn_down_buf[ssm_idx]);
                 }
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
@@ -3043,8 +2953,10 @@ static float* forward_decode() {
                 });
             }
 
-            // Norm + QKV GEMV (traced after first use)
-            if (!g_norm_matmul_traces_valid[layer]) {
+            // Norm + QKV GEMV (traced after caches warm)
+            if (g_norm_matmul_traces_valid[layer]) {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+            } else if (g_all_caches_warm) {
                 norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
                                 g_qkv_rows, MC::n_embd);
                 Finish(cq0);
@@ -3055,7 +2967,8 @@ static float* forward_decode() {
                 g_norm_matmul_traces[layer] = tid;
                 g_norm_matmul_traces_valid[layer] = true;
             } else {
-                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                g_qkv_rows, MC::n_embd);
             }
 
             auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
@@ -3160,7 +3073,11 @@ static float* forward_decode() {
 
             auto t2 = Clock::now();
             if (g_mesh1) {
-                if (!g_ffn_chain_traces_valid[layer]) {
+                if (g_ffn_chain_traces_valid[layer] && g_ffn_chain_traces_valid_1[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
+                    g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else if (g_all_caches_warm) {
                     outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf[layer],
                                               g_wt.attn_ffn_gate_up_buf[attn_idx],
@@ -3174,8 +3091,6 @@ static float* forward_decode() {
                     g_mesh->end_mesh_trace(0, tid0);
                     g_ffn_chain_traces[layer] = tid0;
                     g_ffn_chain_traces_valid[layer] = true;
-                }
-                if (!g_ffn_chain_traces_valid_1[layer]) {
                     write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
                     outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf_1[layer],
@@ -3191,13 +3106,24 @@ static float* forward_decode() {
                     g_mesh1->end_mesh_trace(0, tid1);
                     g_ffn_chain_traces_1[layer] = tid1;
                     g_ffn_chain_traces_valid_1[layer] = true;
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
+                    g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else {
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
+                    outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                              g_wt.attn_ffn_down_buf_1[attn_idx]);
                 }
-                // Replay traces
-                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
-                write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
-                g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
             } else {
-                if (!g_ffn_chain_traces_valid[layer]) {
+                if (g_ffn_chain_traces_valid[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                } else if (g_all_caches_warm) {
                     outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                           g_wt.post_norm_buf[layer],
                                           g_wt.attn_ffn_gate_up_buf[attn_idx],
@@ -3212,7 +3138,10 @@ static float* forward_decode() {
                     g_ffn_chain_traces[layer] = tid;
                     g_ffn_chain_traces_valid[layer] = true;
                 } else {
-                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                          g_wt.post_norm_buf[layer],
+                                          g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                          g_wt.attn_ffn_down_buf[attn_idx]);
                 }
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
@@ -3254,8 +3183,10 @@ static float* forward_decode() {
         // Write norm to chip 1 (chip 0 already has it from above)
         write_f32_to_buf(g_norm_dev_buf_1, g_norm_out.data(), MC::n_embd, g_mesh1.get());
 
-        if (!g_lmhead_trace_valid) {
-            // First call: execute + capture traces
+        if (g_lmhead_trace_valid) {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+            g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
+        } else if (g_all_caches_warm) {
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
             dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
             Finish(cq0);
@@ -3270,8 +3201,8 @@ static float* forward_decode() {
             g_lmhead_trace_1 = tid1;
             g_lmhead_trace_valid = true;
         } else {
-            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
-            g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
         }
 
         // Read from both chips in parallel (each waits for its chip's GEMV)
@@ -3285,9 +3216,11 @@ static float* forward_decode() {
         read_gemv_to_f32(gb_lm0, logits, M0);
         read_gemv_to_f32(gb_lm1, logits + M0, M1);
     } else {
-        // Single-chip LM head (traced)
+        // Single-chip LM head (traced after caches warm)
         auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
-        if (!g_lmhead_trace_valid) {
+        if (g_lmhead_trace_valid) {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+        } else if (g_all_caches_warm) {
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
                           MC::n_vocab, MC::n_embd);
             Finish(cq0);
@@ -3298,13 +3231,15 @@ static float* forward_decode() {
             g_lmhead_trace = tid;
             g_lmhead_trace_valid = true;
         } else {
-            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                          MC::n_vocab, MC::n_embd);
         }
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
         read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
     }
     g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
 
+    if (!g_all_caches_warm) g_all_caches_warm = true;
     g_decode_count++;
     if (g_verbose && g_decode_count % 10 == 0) {
         int dc = g_decode_count;
