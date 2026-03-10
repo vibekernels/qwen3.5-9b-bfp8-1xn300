@@ -14,7 +14,13 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 - `src/kernels/dataflow/` — data movement kernels (readers/writers)
 - `src/tests/` — test suite (test_inference.cpp, test_forward.cpp, benchmarks)
 - `src/third_party/` — third-party headers (json.hpp)
-- `CMakeLists.txt` — CMake build system (root level)
+- `third_party/tt-metal/` — TT-Metalium SDK (git submodule)
+
+## First-time setup
+
+```sh
+make setup             # init tt-metal submodule + build SDK (~13 min)
+```
 
 ## Build & test
 
@@ -25,7 +31,7 @@ make clean             # remove build artifacts
 ```
 
 Environment variables:
-- `TT_METAL_HOME` — tt-metal source tree (default: `/home/ubuntu/tt-metal`)
+- `TT_METAL_HOME` — tt-metal source tree (default: `third_party/tt-metal`)
 - `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
 - `MODEL_PATH` — path to .gguf model file
 

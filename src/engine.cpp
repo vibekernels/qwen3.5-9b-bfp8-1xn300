@@ -44,8 +44,8 @@
 // (CoreCoord, CoreRange, CoreRangeSet, stl→ttsl) — we use the tt::tt_metal:: versions via using-namespace.
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
-// blockfloat_common not installed in build; use source tree path
-#include "/home/ubuntu/tt-metal/tt_metal/impl/data_format/blockfloat_common.hpp"
+// blockfloat_common not installed in build; include via TT_METAL_SRC_PATH
+#include "blockfloat_common.hpp"
 
 using namespace tt::constants;
 using namespace tt;
