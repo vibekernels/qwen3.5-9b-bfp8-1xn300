@@ -29,8 +29,9 @@ COPY src/ src/
 COPY third_party/json.hpp third_party/json.hpp
 COPY Makefile .
 
-# Build the project
-RUN make -j$(nproc)
+# Build the project (target x86-64-v4 for AVX-512 since -march=native
+# won't work in cross-build environments like Docker BuildKit)
+RUN make -j$(nproc) MARCH=x86-64-v4
 
 # Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh

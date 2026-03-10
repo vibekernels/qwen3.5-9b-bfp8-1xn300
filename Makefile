@@ -46,7 +46,8 @@ CXXFLAGS := -std=gnu++20 -Wno-int-to-pointer-cast -fno-omit-frame-pointer \
 	$(TT_DEFINES) $(TT_INCLUDES) -I src -I third_party \
 	-DKERNEL_DIR=\"$(CURDIR)/src/kernels\"
 
-ENGINE_CXXFLAGS := $(CXXFLAGS) -march=native -ffast-math
+MARCH ?= native
+ENGINE_CXXFLAGS := $(CXXFLAGS) -march=$(MARCH) -ffast-math
 LDFLAGS := -rdynamic -Wl,-rpath,$(TT_METAL_BUILD)/lib
 
 # Source files
