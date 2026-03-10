@@ -60,7 +60,7 @@ all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat
 
 # Auto-setup: init submodule + build tt-metal if SDK not found
 $(TT_METAL_BUILD)/lib/libtt_metal.so:
-	git submodule update --init --depth 1
+	git submodule update --init --recursive
 	cd $(TT_METAL_HOME) && ./build_metal.sh
 
 setup: $(TT_METAL_BUILD)/lib/libtt_metal.so
@@ -79,23 +79,23 @@ $(BUILD)/src/%.o: src/%.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Main test targets (link against engine)
-$(BUILD)/test_forward: src/tests/test_forward.cpp $(BUILD)/libqwen_engine.a
+$(BUILD)/test_forward: src/tests/test_forward.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
+	$(CXX) $(CXXFLAGS) src/tests/test_forward.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
 $(BUILD)/test_inference: src/tests/test_inference.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) src/tests/test_inference.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
 # Interactive chat CLI
-$(BUILD)/qwen-chat: src/chat.cpp $(BUILD)/libqwen_engine.a
+$(BUILD)/qwen-chat: src/chat.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
+	$(CXX) $(CXXFLAGS) src/chat.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
 chat: $(BUILD)/qwen-chat
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		$(BUILD)/qwen-chat \
-		$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} 2>/dev/null
+		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} 2>/dev/null
 
 # Standalone test targets (link directly against tt-metal)
 $(BUILD)/test_matmul: src/tests/test_matmul.cpp
@@ -114,13 +114,13 @@ $(BUILD)/test_mesh_overhead: src/tests/test_mesh_overhead.cpp
 quicktest: $(BUILD)/test_forward
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		$(BUILD)/test_forward \
-		$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} \
+		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
 		"The capital of France is" 16 --raw 2>/dev/null
 
 # Run integration test suite
 test: $(BUILD)/test_inference
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) \
-		MODEL_PATH=$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} \
+		MODEL_PATH=$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
 		QUIET=1 \
 		$(BUILD)/test_inference 2>/dev/null
 

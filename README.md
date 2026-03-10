@@ -51,40 +51,38 @@ Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 
 | +Traced execution | ~90 | ~11.1 | Minimal dispatch overhead |
 | +LoFi math fidelity | ~65 | ~15.4 | Faster Tensix compute |
 
-## Building
+## Getting started
 
-Requires tt-metal built from source and clang-20.
+Requires clang-20 and a Tenstorrent N300 device.
 
 ```sh
-cd tt_metal
-mkdir -p build && cd build
-cmake .. -DTT_METAL_BUILD=/path/to/tt-metal/build_Release -DCMAKE_CXX_COMPILER=clang++-20
-make -j$(nproc)
+make setup             # init tt-metal submodule + build SDK (~13 min, first time only)
+make -j$(nproc)        # build everything
+make test              # run integration tests (13 tests, ~60s)
+make quicktest         # fast smoke test: "The capital of France is" -> Paris
 ```
 
-This produces test binaries: `test_device`, `test_matmul`, `test_load_weights`, `test_forward`.
+The model (`unsloth/Qwen3.5-9B-GGUF:BF16`) is automatically downloaded from HuggingFace on first run and cached in `~/.cache/qwen-models/`. To use a local model file instead:
+
+```sh
+MODEL_PATH=/path/to/Qwen3.5-9B-BF16.gguf make test
+```
 
 ## Running inference
 
-Requires `TT_METAL_RUNTIME_ROOT` pointing to your tt-metal source tree:
-
 ```sh
-TT_METAL_RUNTIME_ROOT=/path/to/tt-metal \
-  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "What is the capital of France?" 128
+# Interactive chat:
+make chat
+
+# Single prompt (auto-downloads model if needed):
+make quicktest
+
+# Manual run:
+TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
+  ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "What is the capital of France?" 128
 ```
 
 Pass `--raw` as a 4th argument to skip the chat template and send the prompt directly.
-
-## Tests
-
-All tests require `TT_METAL_RUNTIME_ROOT`:
-
-```sh
-TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_device        # validate N300 device opens
-TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic matmul
-TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_load_weights  # GGUF weight loading
-TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full generation test
-```
 
 ## Project structure
 

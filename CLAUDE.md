@@ -34,7 +34,7 @@ make clean             # remove build artifacts
 Environment variables:
 - `TT_METAL_HOME` — tt-metal source tree (default: `third_party/tt-metal`)
 - `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
-- `MODEL_PATH` — path to .gguf model file
+- `MODEL_PATH` — path to .gguf model file or HuggingFace tag (default: `unsloth/Qwen3.5-9B-GGUF:BF16`)
 
 ## Test suite details
 
@@ -62,9 +62,12 @@ MIN_TOK_PER_SEC=8 make test          # stricter performance threshold
 ```sh
 # Quick test:
 make quicktest
-# Manual run:
+# Manual run (auto-downloads model from HuggingFace on first use):
 TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
-  ./build/test_forward /home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
+  ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "Your prompt here" 128
+# Or with a local model:
+TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
+  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
 ## Measuring decode speed

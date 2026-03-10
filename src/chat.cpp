@@ -3,6 +3,7 @@
 
 #include "engine.h"
 #include "tokenizer.h"
+#include "download.h"
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
@@ -70,11 +71,11 @@ static std::string build_prompt(const std::vector<std::pair<std::string, std::st
 }
 
 int main(int argc, char** argv) {
-    const char* model_path = "/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf";
+    std::string model_spec = "unsloth/Qwen3.5-9B-GGUF:BF16";
     int ctx_size = 2048;
 
-    if (const char* p = getenv("MODEL_PATH")) model_path = p;
-    if (argc >= 2) model_path = argv[1];
+    if (const char* p = getenv("MODEL_PATH")) model_spec = p;
+    if (argc >= 2) model_spec = argv[1];
     if (argc >= 3) ctx_size = atoi(argv[2]);
 
     // Force quiet mode to suppress per-token debug output
@@ -83,10 +84,17 @@ int main(int argc, char** argv) {
     // Save real stdout fd, then redirect stdout to /dev/null during engine init
     g_real_stdout_fd = dup(STDOUT_FILENO);
 
+    // Resolve model (download from HuggingFace if needed)
+    std::string model_path = resolve_model(model_spec);
+    if (model_path.empty()) {
+        write_out("Failed to resolve model: " + model_spec + "\n");
+        return 1;
+    }
+
     write_out("Loading model (ctx=" + std::to_string(ctx_size) + ")...\n");
 
     suppress_stdout();
-    bool ok = load_model_and_tokenizer(model_path, ctx_size);
+    bool ok = load_model_and_tokenizer(model_path.c_str(), ctx_size);
     restore_stdout();
 
     if (!ok) {

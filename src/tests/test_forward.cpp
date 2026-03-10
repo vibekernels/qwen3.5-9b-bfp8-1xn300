@@ -3,6 +3,7 @@
 
 #include "engine.h"
 #include "tokenizer.h"
+#include "download.h"
 #include <cstdio>
 #include <vector>
 #include <string>
@@ -19,7 +20,9 @@ static std::string apply_chat_template(const char* user_msg) {
 }
 
 int main(int argc, char** argv) {
-    const char* model_path = (argc >= 2) ? argv[1] : "models/Qwen3.5-9B-BF16.gguf";
+    std::string model_spec = "unsloth/Qwen3.5-9B-GGUF:BF16";
+    if (const char* p = getenv("MODEL_PATH")) model_spec = p;
+    if (argc >= 2) model_spec = argv[1];
     const char* prompt = (argc >= 3) ? argv[2] : "What is the capital of France?";
     int max_tokens = (argc >= 4) ? atoi(argv[3]) : 128;
     bool raw_mode = (argc >= 5 && std::string(argv[4]) == "--raw");
@@ -28,7 +31,13 @@ int main(int argc, char** argv) {
     printf("Prompt: %s\n", prompt);
     printf("Max tokens: %d\n", max_tokens);
 
-    if (!load_model_and_tokenizer(model_path, 512)) {
+    std::string model_path = resolve_model(model_spec);
+    if (model_path.empty()) {
+        fprintf(stderr, "Failed to resolve model: %s\n", model_spec.c_str());
+        return 1;
+    }
+
+    if (!load_model_and_tokenizer(model_path.c_str(), 512)) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
