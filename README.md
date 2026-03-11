@@ -76,6 +76,12 @@ MODEL_PATH=/path/to/Qwen3.5-9B-BF16.gguf make test
 # Interactive chat:
 make chat
 
+# HTTP server with chat UI (port 8888):
+make serve
+
+# Custom port:
+PORT=9090 make serve
+
 # Single prompt (auto-downloads model if needed):
 make quicktest
 
@@ -86,12 +92,33 @@ TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
 
 Pass `--raw` as a 4th argument to skip the chat template and send the prompt directly.
 
+### HTTP server
+
+`make serve` starts an OpenAI-compatible HTTP server with a built-in chat UI:
+
+- `GET /` — Chat UI (dark theme, markdown rendering, streaming responses)
+- `POST /v1/chat/completions` — OpenAI-compatible API (streaming and non-streaming)
+- `GET /v1/models` — List available models
+- `GET /health` — Health check
+- `GET /api/status` — Model loading progress (downloading/loading/ready/failed)
+
+The model downloads and loads in the background while the server is already accepting connections. The chat UI shows a loading overlay with download progress until the model is ready.
+
+```sh
+# Use as an OpenAI-compatible API:
+curl http://localhost:8888/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
+```
+
 ## Project structure
 
 ```
 src/
   engine.cpp                  # inference engine: forward pass, generate loop
   engine.h                    # public API: load_model_and_tokenizer(), generate(), etc.
+  server.cpp                  # HTTP server with chat UI and OpenAI-compatible API
+  chat.cpp                    # interactive CLI chat
   gguf_loader.{h,cpp}        # GGUF weight loading into device DRAM MeshBuffers
   model_config.h              # Qwen3.5-9B hyperparameters and tile dimensions
   tokenizer.{h,cpp}          # BPE tokenizer (GPT-2 byte-level)
@@ -115,6 +142,7 @@ src/
     test_inference.cpp        # integration test suite
   third_party/
     json.hpp                  # nlohmann/json header
+    httplib.h                 # cpp-httplib HTTP server
 Makefile                      # build system
 ```
 
