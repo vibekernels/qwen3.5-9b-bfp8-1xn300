@@ -95,6 +95,7 @@ $(BUILD)/qwen-chat: src/chat.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 
 chat: $(BUILD)/qwen-chat
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-chat \
 		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} 2>/dev/null
 
@@ -114,6 +115,7 @@ $(BUILD)/test_mesh_overhead: src/tests/test_mesh_overhead.cpp
 # Quick smoke test: "The capital of France is" → should output "Paris"
 quicktest: $(BUILD)/test_forward
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/test_forward \
 		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
 		"The capital of France is" 16 --raw 2>/dev/null
@@ -123,6 +125,7 @@ test: $(BUILD)/test_inference
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) \
 		MODEL_PATH=$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
 		QUIET=1 \
+		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/test_inference 2>/dev/null
 
 clean:

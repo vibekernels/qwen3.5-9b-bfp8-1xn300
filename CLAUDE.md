@@ -100,6 +100,49 @@ Current baselines (as of 2026-03-10):
 - **Decode**: ~8.4 tok/s (119ms/tok)
 - **Prefill**: ~30 tok/s (33ms/tok, batched)
 
+## Debugging hangs
+
+Hangs are the most common failure mode when working with tt-metal. Key lessons:
+
+**Diagnosing hangs with GDB:**
+```sh
+# Attach to a hung process:
+gdb -p $(pgrep test_inference)
+# Get all thread backtraces:
+thread apply all bt
+# Look for threads stuck in: atomic wait, mutex lock, completion_queue_wait_front
+```
+GDB (`sudo apt-get install -y gdb`) is the most effective tool for hang diagnosis.
+Thread backtraces immediately reveal whether a hang is in SDK code, custom thread
+pools, or device completion waits.
+
+**tt-metal SDK hang pitfalls:**
+- `FDMeshCommandQueue::reader_thread_pool_mutex_` is `inline static` — a **global
+  mutex shared across ALL command queue instances**. Concurrent `EnqueueReadMeshBuffer`
+  calls from different submeshes (mesh0 + mesh1) will deadlock. **Always serialize
+  reads**: read chip 0 first, then chip 1.
+- `TT_METAL_OPERATION_TIMEOUT_SECONDS` enables `yield()` in SDK spin loops but the
+  timeout itself never fires — the SDK's progress counter keeps advancing even when
+  the specific completion hasn't arrived. It only detects hard device hangs.
+- Set `NO_TRACES=1` to disable trace replay during debugging (simplifies dispatch path).
+
+**C++20 `std::atomic::wait/notify` (futex) pitfalls:**
+- Classic lost-wakeup bug: `done.wait(done.load())` can pass a **new** value if the
+  atomic changed between the outer check and the inner load. The wait then blocks
+  forever because current == expected. Fix: load once, reuse for both check and wait:
+  ```cpp
+  int val = done.load(std::memory_order_acquire);
+  while (val < target) {
+      done.wait(val, std::memory_order_acquire);
+      val = done.load(std::memory_order_acquire);
+  }
+  ```
+
+**Hang diagnostics in engine.cpp:**
+- `get_hang_info(layer, op)` returns the last layer/operation before a blocking call
+- `g_hang_layer` and `g_hang_op` atomics are updated before each blocking device read
+- test_inference.cpp reports these on timeout for quick root-cause identification
+
 ## Reference model (llama.cpp)
 
 For comparison against llama.cpp:

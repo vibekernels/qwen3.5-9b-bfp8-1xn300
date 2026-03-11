@@ -404,7 +404,9 @@ int main(int argc, char** argv) {
     int timeout_sec = 30;
     if (const char* p = getenv("TEST_TIMEOUT")) timeout_sec = atoi(p);
 
+    bool hung = false;
     auto run_with_timeout = [&](const char* name, void(*fn)()) {
+        if (hung) return;  // skip remaining tests after a hang (device state corrupted)
         printf("\n--- %s ---\n", name);
         fflush(stdout);
         std::atomic<bool> done{false};
@@ -416,10 +418,18 @@ int main(int argc, char** argv) {
         if (done.load()) {
             t.join();
         } else {
-            fprintf(stderr, "FAIL %s: TIMEOUT after %ds\n", name, timeout_sec);
+            int hang_layer, hang_op;
+            get_hang_info(hang_layer, hang_op);
+            const char* op_names[] = {"?", "norm_mm_read", "ffn_wait", "tp_read", "lmhead_read", "prefill",
+                                      "rmsnorm_dispatch", "rmsnorm_finish", "gemv_dispatch", "gemv_finish",
+                                      "norm_mm_read_nb", "norm_mm_finish"};
+            const char* op_name = (hang_op >= 1 && hang_op <= 11) ? op_names[hang_op] : "unknown";
+            fprintf(stderr, "FAIL %s: TIMEOUT after %ds (stuck at layer %d, op=%s)\n",
+                    name, timeout_sec, hang_layer, op_name);
             g_tests++;
             g_failures++;
-            t.detach();  // abandon hung thread; _exit() will clean up
+            t.detach();
+            hung = true;  // abort remaining tests — device is stuck
         }
     };
 
@@ -435,7 +445,9 @@ int main(int argc, char** argv) {
 
     printf("\n%d/%d tests passed\n", g_tests - g_failures, g_tests);
 
-    shutdown();
+    if (!hung) shutdown();
     int rc = g_failures > 0 ? 1 : 0;
+    fflush(stdout);
+    fflush(stderr);
     _exit(rc);  // force-kill any stuck timeout threads
 }

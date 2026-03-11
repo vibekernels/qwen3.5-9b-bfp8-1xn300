@@ -63,6 +63,7 @@ static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
 static bool g_verbose = true;  // set false via QUIET=1 env var
+static bool g_no_traces = false;  // set true via NO_TRACES=1 to disable trace replay (debug)
 static int g_max_ctx = 0;
 static int g_pos = 0;
 
@@ -92,6 +93,10 @@ static std::vector<float> g_conv_state[24];
 
 // Prefix cache: tokens already processed (prompt + generated), for reuse across generate() calls
 static std::vector<int> g_cached_tokens;
+
+// Hang diagnostic: last operation before a blocking device call
+static std::atomic<int> g_hang_layer{-1};
+static std::atomic<int> g_hang_op{0};  // 1=norm_mm_read, 2=ffn_wait, 3=tp_read, 4=lmhead_read
 
 // ============================================================================
 // Cached weight MeshBuffers (on-device, DRAM-sharded BFP8_B tiles)
@@ -1618,59 +1623,6 @@ static std::vector<bfloat16> g_write_host_tiled_bg;   // separate staging buffer
 static std::vector<uint16_t> g_bf16_scratch_bg;        // separate scratch for background tilize
 
 // Persistent worker thread for chip 1 writes
-struct Chip1Writer {
-    std::thread thread;
-    std::mutex mtx;
-    std::condition_variable cv_work;
-    std::condition_variable cv_done;
-    std::function<void()> task;
-    bool has_work = false;
-    bool done = true;
-    bool shutdown = false;
-
-    void start() {
-        thread = std::thread([this]{
-            std::unique_lock<std::mutex> lk(mtx);
-            while (true) {
-                cv_work.wait(lk, [this]{ return has_work || shutdown; });
-                if (shutdown) break;
-                auto fn = std::move(task);
-                lk.unlock();
-                fn();
-                lk.lock();
-                has_work = false;
-                done = true;
-                cv_done.notify_one();
-            }
-        });
-    }
-
-    void submit(std::function<void()> fn) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [this]{ return done; });  // wait for previous task to finish
-        task = std::move(fn);
-        done = false;
-        has_work = true;
-        cv_work.notify_one();
-    }
-
-    void wait() {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [this]{ return done; });
-    }
-
-    void stop() {
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            shutdown = true;
-        }
-        cv_work.notify_one();
-        if (thread.joinable()) thread.join();
-    }
-};
-
-static Chip1Writer g_chip1_writer;
-
 // Persistent thread pool for parallel-for work (deltanet v-head processing)
 // Uses C++20 atomic wait/notify (futex on Linux) — no mutex needed on hot path.
 struct WorkerPool {
@@ -1719,8 +1671,10 @@ struct WorkerPool {
         work_fn(offset, total);
 
         // Wait for all workers (futex-based, no mutex)
-        while (done_count.load(std::memory_order_acquire) < N_WORKERS) {
-            done_count.wait(done_count.load(std::memory_order_relaxed), std::memory_order_acquire);
+        int val = done_count.load(std::memory_order_acquire);
+        while (val < N_WORKERS) {
+            done_count.wait(val, std::memory_order_acquire);
+            val = done_count.load(std::memory_order_acquire);
         }
     }
 
@@ -3222,17 +3176,16 @@ static float* forward_prefill(const int* tokens, int N) {
         dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
         dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
         auto& cq1 = g_mesh1->mesh_command_queue();
-        g_chip1_writer.submit([&]{
-            EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
-        });
+        g_hang_op.store(4, std::memory_order_relaxed);
         EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
-        g_chip1_writer.wait();
+        EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
         read_gemv_to_f32(gb_lm0, logits, M0);
         read_gemv_to_f32(gb_lm1, logits + M0, M1);
     } else {
         auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
         dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
                       MC::n_vocab, MC::n_embd);
+        g_hang_op.store(4, std::memory_order_relaxed);
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
         read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
     }
@@ -3263,7 +3216,7 @@ static float* forward_decode() {
     // One-time micro-benchmark: measure per-program overhead at decode 5
     // Only uses functions already warmed in the forward pass to avoid
     // allocating new kernel binaries while traces are active.
-    if (g_decode_count == 5 && g_verbose) {
+    if (g_decode_count == 5 && g_verbose && !g_no_traces) {
         Finish(cq0);
         auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
 
@@ -3312,17 +3265,13 @@ static float* forward_decode() {
             // 1. On-device rmsnorm + combined GEMV (traced)
             auto t0 = Clock::now();
 
-            // TP reduction: parallel reads from both chips, combine, write back
+            // TP reduction: serial reads from both chips (concurrent reads deadlock on reader_thread_pool_mutex_)
             if (layer > 0 && g_mesh1) {
-                // Start chip 1 read on bg thread (overlaps with chip 0 read)
-                g_chip1_writer.submit([&]{
-                    auto& cq1 = g_mesh1->mesh_command_queue();
-                    read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
-                });
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
                 auto t_dev_done = Clock::now();
                 g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
-                g_chip1_writer.wait();
+                auto& cq1 = g_mesh1->mesh_command_queue();
+                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
                 g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
@@ -3333,12 +3282,13 @@ static float* forward_decode() {
             auto t_after_read = Clock::now();
             g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
 
-            // Start async write of hidden to chip 1 (overlaps with GEMV on chip 0)
+            // Write hidden to chip 1
             if (g_mesh1) {
-                g_chip1_writer.submit([&]{
-                    write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                });
+                write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
+                Finish(g_mesh1->mesh_command_queue());
             }
+
+            g_hang_layer.store(layer, std::memory_order_relaxed);
 
             // On-device rmsnorm + GEMV (traced after caches warm)
             if (g_norm_matmul_traces_valid[layer]) {
@@ -3359,6 +3309,8 @@ static float* forward_decode() {
             }
 
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
+            g_hang_layer.store(layer, std::memory_order_relaxed);
+            g_hang_op.store(1, std::memory_order_relaxed);  // norm_mm_read
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
 
             g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
@@ -3506,9 +3458,6 @@ static float* forward_decode() {
             //  or left on device from previous FFN chain in non-TP mode)
             auto t_rw = Clock::now();
             write_f32_to_buf(g_residual_dev_buf, ssm_proj_in, MC::ssm_d_inner);
-            if (g_mesh1) {
-                g_chip1_writer.wait();  // wait for async hidden write to chip 1
-            }
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw).count();
 
             auto t2 = Clock::now();
@@ -3600,16 +3549,13 @@ static float* forward_decode() {
             // 1. On-device rmsnorm + QKV GEMV (traced)
             auto t0 = Clock::now();
 
-            // TP reduction: parallel reads from both chips, combine, write back
+            // TP reduction: serial reads (concurrent reads deadlock on reader_thread_pool_mutex_)
             if (layer > 0 && g_mesh1) {
-                g_chip1_writer.submit([&]{
-                    auto& cq1 = g_mesh1->mesh_command_queue();
-                    read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
-                });
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
                 auto t_dev_done = Clock::now();
                 g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
-                g_chip1_writer.wait();
+                auto& cq1 = g_mesh1->mesh_command_queue();
+                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
                 g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
@@ -3625,12 +3571,13 @@ static float* forward_decode() {
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
 
-            // Start async write of hidden to chip 1 (overlaps with GEMV on chip 0)
+            // Write hidden to chip 1 synchronously
             if (g_mesh1) {
-                g_chip1_writer.submit([&]{
-                    write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                });
+                write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
+                Finish(g_mesh1->mesh_command_queue());
             }
+
+            g_hang_layer.store(layer, std::memory_order_relaxed);
 
             // Norm + QKV GEMV (traced after caches warm)
             if (g_norm_matmul_traces_valid[layer]) {
@@ -3651,6 +3598,7 @@ static float* forward_decode() {
             }
 
             auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
+            g_hang_op.store(1, std::memory_order_relaxed);  // norm_mm_read
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
             g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -3745,9 +3693,6 @@ static float* forward_decode() {
             // (hidden already on device — written before rmsnorm+GEMV trace)
             auto t_rw2 = Clock::now();
             write_f32_to_buf(g_residual_dev_buf, attn_out, MC::n_head * MC::head_dim);
-            if (g_mesh1) {
-                g_chip1_writer.wait();  // wait for async hidden write to chip 1
-            }
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw2).count();
 
             auto t2 = Clock::now();
@@ -3834,12 +3779,9 @@ static float* forward_decode() {
 
     // Read hidden from device (waits for last FFN chain) + TP reduction
     if (g_mesh1) {
-        g_chip1_writer.submit([&]{
-            auto& cq1 = g_mesh1->mesh_command_queue();
-            read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
-        });
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
-        g_chip1_writer.wait();
+        auto& cq1 = g_mesh1->mesh_command_queue();
+        read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
         for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
     } else {
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
@@ -3884,12 +3826,11 @@ static float* forward_decode() {
             dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
         }
 
-        // Read from both chips in parallel (each waits for its chip's GEMV)
-        g_chip1_writer.submit([&]{
-            EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
-        });
+        // Read from both chips serially (concurrent reads deadlock on reader_thread_pool_mutex_)
+        g_hang_layer.store(99, std::memory_order_relaxed);
+        g_hang_op.store(4, std::memory_order_relaxed);  // lmhead_read
         EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
-        g_chip1_writer.wait();
+        EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
 
         // Untilize: chip 0 has first M0 rows, chip 1 has next M1 rows
         read_gemv_to_f32(gb_lm0, logits, M0);
@@ -3918,7 +3859,7 @@ static float* forward_decode() {
     }
     g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
 
-    if (!g_all_caches_warm) g_all_caches_warm = true;
+    if (!g_all_caches_warm && !g_no_traces) g_all_caches_warm = true;
     g_decode_count++;
     if (g_verbose && g_decode_count % 10 == 0) {
         int dc = g_decode_count;
@@ -3942,6 +3883,7 @@ static float* forward_decode() {
 
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     if (getenv("QUIET")) g_verbose = false;
+    if (getenv("NO_TRACES")) g_no_traces = true;
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
     // Open both N300 chips as a 1×2 MeshDevice, then create submeshes
@@ -3970,7 +3912,6 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     if (g_mesh1) {
         auto grid1 = g_mesh1->compute_with_storage_grid_size();
         printf("Chip 1: compute grid %zux%zu (%zu cores)\n", grid1.x, grid1.y, grid1.x * grid1.y);
-        g_chip1_writer.start();
     }
     g_worker_pool.start();
 
@@ -4200,12 +4141,16 @@ const Tokenizer& get_tokenizer() {
     return g_tokenizer;
 }
 
+void get_hang_info(int& layer, int& op) {
+    layer = g_hang_layer.load(std::memory_order_relaxed);
+    op = g_hang_op.load(std::memory_order_relaxed);
+}
+
 void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
 
     // Stop background threads
-    g_chip1_writer.stop();
     g_worker_pool.stop();
 
     // Release traces
