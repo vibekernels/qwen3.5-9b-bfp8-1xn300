@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PORT="${PORT:-8888}"
+PORT="${SERVER_PORT:-${PORT:-8888}}"
 MODEL="${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16}"
 CTX_SIZE="${CTX_SIZE:-4096}"
 

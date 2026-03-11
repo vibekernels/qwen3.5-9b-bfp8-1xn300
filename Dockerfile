@@ -59,7 +59,7 @@ RUN chmod +x /entrypoint.sh
 ENV MODEL_PATH=unsloth/Qwen3.5-9B-GGUF:BF16
 ENV TT_METAL_RUNTIME_ROOT=/app/third_party/tt-metal
 ENV QUIET=1
-ENV PORT=8888
+ENV SERVER_PORT=8888
 
 EXPOSE 8888 22
 
