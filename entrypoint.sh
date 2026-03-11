@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 PORT="${PORT:-8888}"
 MODEL="${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16}"
@@ -13,10 +12,14 @@ if [ -n "$PUBLIC_KEY" ]; then
     echo "SSH server started on port 22"
 fi
 
-echo "Starting qwen-server on port $PORT (model: $MODEL, ctx: $CTX_SIZE)"
-
-exec /app/build/qwen-server \
-    -m "$MODEL" \
-    --host 0.0.0.0 \
-    --port "$PORT" \
-    --ctx-size "$CTX_SIZE"
+# Run qwen-server in a restart loop so SSH remains available if it exits
+while true; do
+    echo "Starting qwen-server on port $PORT (model: $MODEL, ctx: $CTX_SIZE)"
+    /app/build/qwen-server \
+        -m "$MODEL" \
+        --host 0.0.0.0 \
+        --port "$PORT" \
+        --ctx-size "$CTX_SIZE"
+    echo "qwen-server exited (status $?), restarting in 5 seconds..."
+    sleep 5
+done

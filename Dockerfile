@@ -4,16 +4,10 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies + SSH server
+# Install build dependencies (SSH installed later to maximize cache hits on tt-metal layer)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl make openssh-server && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /var/run/sshd /root/.ssh && \
-    chmod 700 /root/.ssh && \
-    ssh-keygen -A && \
-    sed -i 's/#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
-    sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
-    sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    apt-get install -y --no-install-recommends curl make && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -29,6 +23,17 @@ RUN git init third_party/tt-metal && \
     git submodule update --init --recursive && \
     git tag v0.0.0 && \
     ./build_metal.sh
+
+# Install SSH server (after tt-metal build to preserve cache)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openssh-server && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/run/sshd /root/.ssh && \
+    chmod 700 /root/.ssh && \
+    ssh-keygen -A && \
+    sed -i 's/#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
 # Copy project source
 COPY src/ src/
