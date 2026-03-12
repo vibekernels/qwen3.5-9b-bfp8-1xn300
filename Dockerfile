@@ -48,6 +48,10 @@ RUN apt-get update && \
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Embed build version (git SHA) — must be last ARG to avoid cache busting earlier layers
+ARG GIT_SHA=unknown
+ENV BUILD_VERSION=${GIT_SHA}
+
 # Model is downloaded at runtime via the binary's built-in HuggingFace resolver.
 # To bake the model into the image for faster cold starts, uncomment:
 # RUN mkdir -p /models && \
@@ -55,7 +59,7 @@ RUN chmod +x /entrypoint.sh
 #       "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-BF16.gguf"
 # ENV MODEL_PATH=/models/Qwen3.5-9B-BF16.gguf
 
-ENV MODEL_PATH=unsloth/Qwen3.5-9B-GGUF:BF16
+ENV MODEL_PATH=vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled
 ENV TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium
 ENV QUIET=1
 ENV SERVER_PORT=8888

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+echo "qwen-server build: ${BUILD_VERSION:-dev}"
+
 PORT="${SERVER_PORT:-${PORT:-8888}}"
 MODEL="${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled}"
 CTX_SIZE="${CTX_SIZE:-4096}"
