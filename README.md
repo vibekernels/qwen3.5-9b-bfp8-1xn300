@@ -1,165 +1,94 @@
 # qwen3.5-9b-bfp8b-1xn300
 
-Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metalium APIs. No ttnn dependency — all matmuls, norms, and element-wise ops use custom Tensix kernels.
+Custom inference engine for [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) on a single Tenstorrent N300 card (two Wormhole chips). All device operations use hand-written Tensix kernels via the tt-metalium C++ API — no ttnn dependency. Supports prefix caching for fast multi-turn conversations.
 
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=qwen3-5-9b-n300&type=docker&image=ghcr.io%2Fvibekernels%2Fqwen3.5-9b-bfp8b-1xn300:latest&instance_type=gpu-tenstorrent-n300s&regions=na&instances_min=1&hc_grace_period%5B8888%5D=900&ports=8888;http;/&ports=22;tcp;;true;tcp&env%5BPUBLIC_KEY%5D=REPLACE_ME)
 
-To enable SSH access, set `PUBLIC_KEY` to your SSH public key (e.g. contents of `~/.ssh/id_ed25519.pub`). Koyeb will assign a TCP proxy domain and port for SSH connections.
-
-## Architecture
-
-Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (every 4th) and 24 SSM delta-net recurrent layers.
-
-- **Custom DRAM-sharded GEMV kernels** on Tensix cores (12 cores per chip, one per DRAM bank, TRID pipelining)
-- **Tensor-parallel FFN** across both chips: gate/up weights split by M, down weights split by K, host-side TP reduction
-- **Custom on-device RMSNorm** (single-core FPU kernel, eliminates PCIe round-trip)
-- **Custom eltwise kernels**: add, multiply, SwiGLU, fused GEMV+residual-add
-- **On-device FFN chain**: outproj+resadd → RMSNorm → gate+up GEMV split → SwiGLU → down GEMV+resadd, all as a single traced operation per chip
-- **Fused gate+up GEMV** with split writer kernel (single weight matrix, two output buffers)
-- **SSM recurrence** and **attention** (online softmax + KV cache) run on host CPU in f32 with AVX-512
-- **Metal Traces** capture and replay device op sequences with near-zero dispatch overhead
-- **BFP8_B weights** (8-bit block floating point, 1088 bytes/tile) — 47% less DRAM bandwidth than BF16
-
 ## Performance
+
+Measured on a Tenstorrent N300 (2x Wormhole) in a 4-CPU container. The first few tokens are slower while Metal Traces are captured; subsequent tokens run at steady state.
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~122 ms/tok |
-| Decode throughput | ~8.2 tok/s |
+| Decode throughput | ~8.2 tok/s (~122 ms/tok) |
 | Prefill throughput | ~87 tok/s |
-| Model size (device) | ~9.5 GB BFP8_B across 2 chips |
+| Model size on device | ~9.5 GB (BFP8_B across 2 chips) |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips) in a 4-CPU container. The first few tokens are slower while traces are captured; subsequent tokens stabilize at ~122ms.
+## Requirements
 
-### Decode time breakdown (steady state)
+- Tenstorrent N300 card
+- clang-20
+- tt-metalium SDK v0.66 (installed via debs)
 
-| Component | Time | Notes |
-|-----------|------|-------|
-| norm + pre-layer GEMV | 54 ms | Includes waiting for previous FFN chain (35.8ms) + GEMV read (18.3ms) |
-| FFN chain (device) | 29.3 ms | Overlaps with host pipeline; ~0.9 ms/layer |
-| TP reduction | 6.4 ms | Host-side: read both chips, f32 add, write back |
-| Host compute | 3 ms | conv1d (0.5ms), deltanet (2.0ms), attention (0.3ms) |
-| Residual writes | 2 ms | 32 PCIe writes per token |
-| LM head | 6 ms | Output norm + 2-chip parallel GEMV + read |
-| FFN dispatch | 3 ms | Non-blocking trace replay |
+## Setup
 
-### Performance history
-
-| Milestone | ms/tok | tok/s | Key change |
-|-----------|--------|-------|------------|
-| Initial | ~700 | ~1.4 | ttnn::matmul on device |
-| +BFP8_B packing | ~480 | ~2.1 | 47% less weight bandwidth |
-| +Pre-alloc buffers | ~290 | ~3.4 | Zero-alloc dispatch |
-| +Dual chip TP | ~165 | ~6.1 | 2x DRAM bandwidth for FFN |
-| +Custom GEMV kernels | ~140 | ~7.1 | DRAM-sharded, TRID pipeline |
-| +Traced execution | ~122 | ~8.2 | Minimal dispatch overhead |
-
-## Getting started
-
-Requires clang-20 and a Tenstorrent N300 device.
+Install the tt-metalium debs (one-time):
 
 ```sh
-./install-tt-metal-debs.sh  # install tt-metal debs (first time only)
-make -j$(nproc)             # build everything
-make test                   # run integration tests (~60s)
-make quicktest              # fast smoke test: "The capital of France is" -> Paris
+~/install-tt-metal-debs.sh
 ```
 
-The model (`unsloth/Qwen3.5-9B-GGUF:BF16`) is automatically downloaded from HuggingFace on first run and cached in `~/.cache/qwen-models/`. To use a local model file instead:
+Build everything:
 
 ```sh
-MODEL_PATH=/path/to/Qwen3.5-9B-BF16.gguf make test
+make -j$(nproc)
 ```
 
-## Running inference
+The default model (`vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled`) is automatically downloaded from HuggingFace on first run and cached in `~/.cache/qwen-models/`.
+
+Run the smoke test to verify everything works:
 
 ```sh
-# Interactive chat:
-make chat
-
-# HTTP server with chat UI (port 8888):
-make serve
-
-# Custom port:
-PORT=9090 make serve
-
-# Single prompt (auto-downloads model if needed):
-make quicktest
-
-# Manual run:
-TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
-  ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "What is the capital of France?" 128
+make quicktest    # "The capital of France is" -> Paris
 ```
 
-Pass `--raw` as a 4th argument to skip the chat template and send the prompt directly.
+Run the full integration test suite (~60s, 8 tests):
 
-### HTTP server
+```sh
+make test
+```
 
-`make serve` starts an OpenAI-compatible HTTP server with a built-in chat UI:
+## Running
 
-- `GET /` — Chat UI (dark theme, markdown rendering, streaming responses)
-- `POST /v1/chat/completions` — OpenAI-compatible API (streaming and non-streaming)
-- `GET /v1/models` — List available models
+```sh
+make chat               # interactive chat CLI
+make serve              # HTTP server on port 8888
+make quicktest          # single-prompt smoke test
+```
+
+The HTTP server provides an OpenAI-compatible API and a built-in chat UI:
+
+- `GET /` — Chat UI with streaming responses
+- `POST /v1/chat/completions` — OpenAI-compatible chat API
+- `GET /v1/models` — Model list
 - `GET /health` — Health check
-- `GET /api/status` — Model loading progress (downloading/loading/ready/failed)
-
-The model downloads and loads in the background while the server is already accepting connections. The chat UI shows a loading overlay with download progress until the model is ready.
 
 ```sh
-# Use as an OpenAI-compatible API:
 curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
 ```
 
-## Project structure
+## Docker
 
-```
-src/
-  engine.cpp                  # inference engine: forward pass, generate loop
-  engine.h                    # public API: load_model_and_tokenizer(), generate(), etc.
-  server.cpp                  # HTTP server with chat UI and OpenAI-compatible API
-  chat.cpp                    # interactive CLI chat
-  gguf_loader.{h,cpp}        # GGUF weight loading into device DRAM MeshBuffers
-  model_config.h              # Qwen3.5-9B hyperparameters and tile dimensions
-  tokenizer.{h,cpp}          # BPE tokenizer (GPT-2 byte-level)
-  download.{h,cpp}           # HuggingFace model download
-  kernels/
-    compute/
-      gemv.cpp                # GEMV compute kernel (matmul_tiles accumulation)
-      rmsnorm.cpp             # RMSNorm compute kernel
-      eltwise_binary.cpp      # Element-wise add/multiply compute kernel
-      swiglu.cpp              # SwiGLU activation compute kernel
-    dataflow/
-      reader_gemv_dram_sharded.cpp  # DRAM-sharded GEMV reader (TRID pipelining)
-      writer_gemv.cpp               # Standard GEMV writer
-      writer_gemv_split.cpp         # Split writer (gate+up → two buffers)
-      writer_gemv_resadd.cpp        # GEMV writer with fused residual add
-  tests/
-    test_device.cpp           # device validation
-    test_matmul.cpp           # basic matmul test
-    test_load_weights.cpp     # weight loading test
-    test_forward.cpp          # end-to-end generation test
-    test_inference.cpp        # integration test suite
-  third_party/
-    json.hpp                  # nlohmann/json header
-    httplib.h                 # cpp-httplib HTTP server
-Makefile                      # build system
+Build and run locally:
+
+```sh
+docker build -t qwen-n300 .
+docker run --rm --device /dev/tenstorrent -p 8888:8888 qwen-n300
 ```
 
-## Key optimizations
+The container image is published to `ghcr.io/vibekernels/qwen3.5-9b-bfp8b-1xn300:latest` on every push to `main`. It can be deployed to [Koyeb](https://www.koyeb.com/) with a Tenstorrent N300 GPU instance — use the deploy button at the top of this page.
 
-- **Custom DRAM-sharded GEMV**: 12 reader cores (one per DRAM bank) with TRID-pipelined weight reads for maximum bandwidth
-- **BFP8_B weights** (1088 bytes/tile vs 2048 for BF16) with native hardware decompression
-- **Tensor-parallel FFN** across 2 chips: each chip handles half the FFN width
-- **Fused gate+up GEMV**: single weight matrix with split writer avoids redundant activation reads
-- **Fused GEMV+residual-add**: output projection and residual addition in one kernel pass
-- **Metal Traces** for norm+GEMV and FFN chain ops (near-zero dispatch overhead on replay)
-- **LoFi math fidelity** for all GEMVs (faster Tensix multiply-accumulate)
-- **Async chip 1 dispatch**: hidden state write to chip 1 overlaps with chip 0 GEMV
-- **2-chip LM head**: vocabulary rows split across chips for 2x read bandwidth
-- **AVX-512 host compute**: vectorized conv1d, deltanet recurrence, attention, RoPE
-- **Pre-allocated device buffers** for zero-allocation GEMV dispatch
-- **Pre-computed RoPE tables** (avoids trig calls per token)
-- **Raw bf16 bit operations** for f32<->bf16 conversion (no bfloat16 class overhead)
-- **Static scratch buffers** for all forward pass intermediates (no heap allocation per token)
+## Environment variables
+
+All `make` targets and the Docker container use sensible defaults. Override as needed:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PATH` | `vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled` | GGUF model file or HuggingFace tag |
+| `CTX_SIZE` | `4096` | Maximum context length |
+| `PORT` | `8888` | HTTP server port |
+| `PUBLIC_KEY` | (none) | SSH public key for container remote access |
+| `QUIET` | `0` | Set `1` to suppress per-token debug output |
+| `NO_TRACES` | `0` | Set `1` to disable Metal Trace replay (useful for debugging) |

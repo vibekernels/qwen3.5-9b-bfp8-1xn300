@@ -10,30 +10,32 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 - `src/model_config.h` — model hyperparameters and tile dimensions
 - `src/tokenizer.{h,cpp}` — BPE tokenizer (GPT-2 byte-level)
 - `src/download.{h,cpp}` — HuggingFace model download
+- `src/server.cpp` — HTTP server with OpenAI-compatible API and chat UI
+- `src/chat.cpp` — interactive CLI chat
 - `src/kernels/compute/` — Tensix compute kernels (gemv, rmsnorm, swiglu, etc.)
 - `src/kernels/dataflow/` — data movement kernels (readers/writers)
-- `src/tests/` — test suite (test_inference.cpp, test_forward.cpp, benchmarks)
-- `third_party/` — third-party headers (json.hpp, blockfloat_common.hpp)
-
-## First-time setup
-
-Install the tt-metal debs (one-time):
-```sh
-~/install-tt-metal.sh
-```
+- `src/tests/` — test suite (test_inference.cpp, test_forward.cpp)
+- `third_party/` — third-party headers (json.hpp, httplib.h, blockfloat_common.hpp)
 
 ## Build & test
 
 ```sh
-make -j$(nproc)        # build everything
-make test              # run integration tests (~60s)
-make quicktest         # fast smoke test: "The capital of France is" → Paris
-make clean             # remove build artifacts
+~/install-tt-metal-debs.sh      # install tt-metalium debs (one-time)
+make -j$(nproc)            # build everything
+make test                  # run integration tests (~60s, 8 tests)
+make quicktest             # fast smoke test: "The capital of France is" → Paris
+make clean                 # remove build artifacts
 ```
 
-Environment variables:
-- `TT_METAL_DEB` — deb install prefix (default: `/usr`)
-- `MODEL_PATH` — path to .gguf model file or HuggingFace tag (default: `vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled`)
+## Running
+
+```sh
+make chat                  # interactive chat CLI
+make serve                 # HTTP server on port 8888
+make quicktest             # single-prompt smoke test
+```
+
+The HTTP server exposes `GET /` (chat UI), `POST /v1/chat/completions` (OpenAI-compatible API), `GET /v1/models`, `GET /health`, and `GET /api/status`.
 
 ## Test suite details
 
@@ -56,19 +58,6 @@ DECODE_COUNT=64 make test            # more decode tokens for tok/s test
 MIN_TOK_PER_SEC=8 make test          # stricter performance threshold
 ```
 
-## Manual inference
-
-```sh
-# Quick test:
-make quicktest
-# Manual run (auto-downloads model from HuggingFace on first use):
-TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
-  ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "Your prompt here" 128
-# Or with a local model:
-TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
-  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
-```
-
 ## Measuring decode speed
 
 The `test_tok_per_sec` test measures decode tok/s by subtracting the actual prefill
@@ -82,18 +71,9 @@ test_basic_generation...
 
 That `8.3 tok/s` is total wall time (prefill + decode) ÷ tokens. With a very short
 prompt (4 tokens, ~300ms prefill), the number closely reflects true single-token
-decode speed. For a purer decode-only measurement, use a short prompt and many
-decode tokens:
-
-```sh
-TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium QUIET=1 \
-  ./build/test_forward "$MODEL_PATH" "1+1=" 64 --raw 2>/dev/null
-```
-
-Then compute: `(total_time - prefill_time) / decode_tokens`. The `[prefill: X ms]`
-line gives actual prefill time. Do NOT hardcode a ms/tok estimate for prefill
-subtraction — batched prefill (~33ms/tok) is very different from single-token
-(~120ms/tok), and short prompts don't batch well (~73ms/tok for <32 tokens).
+decode speed. Do NOT hardcode a ms/tok estimate for prefill subtraction — batched
+prefill (~33ms/tok) is very different from single-token (~120ms/tok), and short
+prompts don't batch well (~73ms/tok for <32 tokens).
 
 Current baselines (as of 2026-03-12, 4-CPU container):
 - **Decode**: ~8.2 tok/s (122ms/tok avg)
