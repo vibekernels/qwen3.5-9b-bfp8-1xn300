@@ -37,6 +37,7 @@ RUN apt-get update && \
 
 # Copy project source
 COPY src/ src/
+COPY tools/ tools/
 COPY third_party/json.hpp third_party/json.hpp
 COPY third_party/httplib.h third_party/httplib.h
 COPY Makefile .
