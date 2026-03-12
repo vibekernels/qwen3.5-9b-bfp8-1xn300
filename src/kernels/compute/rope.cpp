@@ -21,7 +21,7 @@
 //   out0 = x0 * cos - x1 * sin
 //   out1 = x1 * cos + x0 * sin
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

@@ -4,27 +4,36 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies (SSH installed later to maximize cache hits on tt-metal layer)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl make && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install tt-metal debs (runtime + dev headers + JIT compiler)
+# The base image has tt-metal as a Python package but not as system debs,
+# so we install all four to get the C++ headers and system libs needed to build.
+ARG TT_METAL_VERSION=0.66.0
+RUN TMP=$(mktemp -d) && \
+    BASE="https://github.com/tenstorrent/tt-metal/releases/download/v${TT_METAL_VERSION}" && \
+    wget -q -P "$TMP" \
+        "$BASE/tt-metalium_${TT_METAL_VERSION}.ubuntu22.04_amd64.deb" \
+        "$BASE/tt-metalium-dev_${TT_METAL_VERSION}.ubuntu22.04_amd64.deb" \
+        "$BASE/tt-metalium-jit_${TT_METAL_VERSION}.ubuntu22.04_amd64.deb" \
+        "$BASE/tt-nn_${TT_METAL_VERSION}.ubuntu22.04_amd64.deb" && \
+    apt-get update && \
+    apt-get install -y "$TMP"/*.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* "$TMP"
 
 WORKDIR /app
 
-# Clone tt-metal at the pinned submodule commit and build the SDK.
-# The base image has runtime libs but no C++ headers, so we build from source.
-# A fake git tag provides the version that CMake's packaging step requires.
-ARG TT_METAL_COMMIT=967fb02dd27a79ceea8f85dab2e8ee578f0ba82d
-RUN git init third_party/tt-metal && \
-    cd third_party/tt-metal && \
-    git remote add origin https://github.com/tenstorrent/tt-metal.git && \
-    git fetch --depth 1 origin $TT_METAL_COMMIT && \
-    git checkout FETCH_HEAD && \
-    git submodule update --init --recursive && \
-    git tag v0.0.0 && \
-    ./build_metal.sh
+# Copy project source
+COPY src/ src/
+COPY tools/ tools/
+COPY third_party/json.hpp third_party/json.hpp
+COPY third_party/httplib.h third_party/httplib.h
+COPY third_party/blockfloat_common.hpp third_party/blockfloat_common.hpp
+COPY Makefile .
 
-# Install SSH server (after tt-metal build to preserve cache)
+# Build the project (target x86-64-v4 for AVX-512 since -march=native
+# won't work in cross-build environments like Docker BuildKit)
+RUN make -j$(nproc) MARCH=x86-64-v4
+
+# Install SSH server (after build to preserve cache on source changes)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -34,17 +43,6 @@ RUN apt-get update && \
     sed -i 's/#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
     sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-
-# Copy project source
-COPY src/ src/
-COPY tools/ tools/
-COPY third_party/json.hpp third_party/json.hpp
-COPY third_party/httplib.h third_party/httplib.h
-COPY Makefile .
-
-# Build the project (target x86-64-v4 for AVX-512 since -march=native
-# won't work in cross-build environments like Docker BuildKit)
-RUN make -j$(nproc) MARCH=x86-64-v4
 
 # Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
@@ -58,7 +56,7 @@ RUN chmod +x /entrypoint.sh
 # ENV MODEL_PATH=/models/Qwen3.5-9B-BF16.gguf
 
 ENV MODEL_PATH=unsloth/Qwen3.5-9B-GGUF:BF16
-ENV TT_METAL_RUNTIME_ROOT=/app/third_party/tt-metal
+ENV TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium
 ENV QUIET=1
 ENV SERVER_PORT=8888
 

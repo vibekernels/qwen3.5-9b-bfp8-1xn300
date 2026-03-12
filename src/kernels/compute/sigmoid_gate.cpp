@@ -5,7 +5,7 @@
 // Input: attn_out tiles in c_0, gate tiles in c_1
 // Output: sigmoid(gate) * attn_out in c_16
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

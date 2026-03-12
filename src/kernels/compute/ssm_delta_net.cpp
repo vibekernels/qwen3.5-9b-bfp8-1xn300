@@ -26,7 +26,7 @@
 //   c_16: output tiles
 //   c_17: updated state tiles (written back)
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

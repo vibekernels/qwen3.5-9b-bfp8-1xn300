@@ -5,7 +5,7 @@
 // Input: tiles from c_0 and c_1
 // Output: sum tiles in c_16
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

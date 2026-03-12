@@ -13,13 +13,13 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 - `src/kernels/compute/` — Tensix compute kernels (gemv, rmsnorm, swiglu, etc.)
 - `src/kernels/dataflow/` — data movement kernels (readers/writers)
 - `src/tests/` — test suite (test_inference.cpp, test_forward.cpp, benchmarks)
-- `third_party/` — third-party headers (json.hpp) and tt-metal SDK (git submodule)
-- `third_party/tt-metal/` — TT-Metalium SDK (git submodule)
+- `third_party/` — third-party headers (json.hpp, blockfloat_common.hpp)
 
 ## First-time setup
 
+Install the tt-metal debs (one-time):
 ```sh
-make setup             # init tt-metal submodule + build SDK (~13 min)
+~/install-tt-metal.sh
 ```
 
 ## Build & test
@@ -32,8 +32,7 @@ make clean             # remove build artifacts
 ```
 
 Environment variables:
-- `TT_METAL_HOME` — tt-metal source tree (default: `third_party/tt-metal`)
-- `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
+- `TT_METAL_DEB` — deb install prefix (default: `/usr`)
 - `MODEL_PATH` — path to .gguf model file or HuggingFace tag (default: `vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled`)
 
 ## Test suite details
@@ -63,10 +62,10 @@ MIN_TOK_PER_SEC=8 make test          # stricter performance threshold
 # Quick test:
 make quicktest
 # Manual run (auto-downloads model from HuggingFace on first use):
-TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
+TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
   ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "Your prompt here" 128
 # Or with a local model:
-TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
+TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
   ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
@@ -87,7 +86,7 @@ decode speed. For a purer decode-only measurement, use a short prompt and many
 decode tokens:
 
 ```sh
-TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal QUIET=1 \
+TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium QUIET=1 \
   ./build/test_forward "$MODEL_PATH" "1+1=" 64 --raw 2>/dev/null
 ```
 

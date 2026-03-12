@@ -12,7 +12,7 @@
 //   c_2: gate tiles (z)
 //   c_16: output tiles
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

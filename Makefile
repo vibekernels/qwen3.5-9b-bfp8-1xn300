@@ -1,36 +1,33 @@
 # Qwen 3.5-9B inference on Tenstorrent N300
 # Usage:
-#   make setup            — init submodule + build tt-metal (first time only)
 #   make                  — build everything
 #   make quicktest        — smoke test: "The capital of France is"
 #   make test             — run full integration tests
 #   make clean            — remove build artifacts
 #
 # Environment:
-#   TT_METAL_HOME         — tt-metal source tree    (default: third_party/tt-metal)
-#   TT_METAL_BUILD        — tt-metal build dir      (default: $(TT_METAL_HOME)/build_Release)
+#   TT_METAL_DEB          — deb-installed SDK prefix (default: /usr)
+#                           requires: tt-metalium tt-metalium-dev tt-metalium-jit tt-nn debs
 #   MODEL_PATH            — path to .gguf model     (default: vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled)
 
-TT_METAL_HOME  ?= $(CURDIR)/third_party/tt-metal
-TT_METAL_BUILD ?= $(TT_METAL_HOME)/build_Release
+TT_METAL_DEB   ?= /usr
 CXX            := clang++-20
 BUILD          := build
 
-# tt-metal SDK paths (extracted from CMake find_package(TT-Metalium))
+_TT_LIBEXEC := $(TT_METAL_DEB)/libexec/tt-metalium
+
 TT_INCLUDES := \
-	-isystem $(TT_METAL_BUILD)/include \
-	-isystem $(TT_METAL_BUILD)/libexec/tt-metalium/tt_metal/hostdevcommon/api \
-	-isystem $(TT_METAL_BUILD)/libexec/tt-metalium \
-	-isystem $(TT_METAL_BUILD)/include/metalium-thirdparty \
-	-isystem $(TT_METAL_HOME)/tt_metal/impl/data_format
+	-isystem $(_TT_LIBEXEC)/tt_metal/hostdevcommon/api \
+	-isystem $(_TT_LIBEXEC) \
+	-isystem $(TT_METAL_DEB)/include/metalium-thirdparty
 
 TT_LIBS := \
-	$(TT_METAL_BUILD)/lib/libtt_metal.so \
-	$(TT_METAL_BUILD)/lib/libtracy.so.0.10.0 \
+	$(TT_METAL_DEB)/lib/libtt_metal.so \
+	$(TT_METAL_DEB)/lib/libtracy.so.0.10.0 \
 	-ldl \
-	$(TT_METAL_BUILD)/lib/libdevice.so \
-	$(TT_METAL_BUILD)/lib/libtt_stl.so \
-	$(TT_METAL_BUILD)/lib/libspdlog.a
+	$(TT_METAL_DEB)/lib/libdevice.so \
+	$(TT_METAL_DEB)/lib/libtt_stl.so \
+	-lspdlog -lfmt
 
 TT_DEFINES := \
 	-DENCHANTUM_ENABLE_MSVC_SPEEDUP=1 \
@@ -48,45 +45,27 @@ CXXFLAGS := -O3 -std=gnu++20 -Wno-int-to-pointer-cast -fno-omit-frame-pointer \
 
 MARCH ?= native
 ENGINE_CXXFLAGS := $(CXXFLAGS) -march=$(MARCH) -ffast-math
-LDFLAGS := -rdynamic -Wl,-rpath,$(TT_METAL_BUILD)/lib
+LDFLAGS := -rdynamic -Wl,-rpath,$(TT_METAL_DEB)/lib
 
 # Source files
 ENGINE_SRCS := src/engine.cpp src/gguf_loader.cpp src/tokenizer.cpp
 ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 
 # Targets
-.PHONY: all clean test quicktest setup chat serve
+.PHONY: all clean test quicktest chat serve
 
 all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat $(BUILD)/qwen-server $(BUILD)/make_bfp8_gguf
-
-# Auto-setup: init submodule + build tt-metal if SDK not found
-# Only the three required submodules (tracy, tt_llk, umd) are needed; skipping
-# the full --recursive init avoids cloning large demo submodules like llama2_70b.
-# Build flags:
-#   --without-python-bindings  skip _ttnncpp.so (~5-7 min saved)
-#   --without-distributed      skip OpenMPI (not needed for single-machine MeshDevice)
-$(TT_METAL_BUILD)/lib/libtt_metal.so:
-	git submodule update --init --depth 1 third_party/tt-metal
-	cd $(TT_METAL_HOME) && git submodule update --init --depth 1 \
-		tt_metal/third_party/tracy \
-		tt_metal/third_party/tt_llk \
-		tt_metal/third_party/umd
-	cd $(TT_METAL_HOME) && ./build_metal.sh \
-		--without-python-bindings \
-		--without-distributed
-
-setup: $(TT_METAL_BUILD)/lib/libtt_metal.so
 
 # Engine static library
 $(BUILD)/libqwen_engine.a: $(ENGINE_OBJS)
 	@mkdir -p $(@D)
 	ar rcs $@ $^
 
-$(BUILD)/src/engine.o: src/engine.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
+$(BUILD)/src/engine.o: src/engine.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(ENGINE_CXXFLAGS) -c $< -o $@
 
-$(BUILD)/src/%.o: src/%.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
+$(BUILD)/src/%.o: src/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -105,7 +84,7 @@ $(BUILD)/qwen-chat: src/chat.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	$(CXX) $(CXXFLAGS) src/chat.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
 chat: $(BUILD)/qwen-chat
-	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+	@env TT_METAL_RUNTIME_ROOT=$(_TT_LIBEXEC) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-chat \
 		$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} 2>/dev/null
@@ -116,14 +95,14 @@ $(BUILD)/qwen-server: src/server.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	$(CXX) $(CXXFLAGS) src/server.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS) -lpthread
 
 serve: $(BUILD)/qwen-server
-	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+	@env TT_METAL_RUNTIME_ROOT=$(_TT_LIBEXEC) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-server \
 		-m $${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
 		--port $${PORT:-8888} 2>/dev/null
 
 # BFP8_B GGUF converter — downloads BF16, converts to BFP8_B tiled GGUF
-$(BUILD)/make_bfp8_gguf: tools/make_bfp8_gguf.cpp src/download.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
+$(BUILD)/make_bfp8_gguf: tools/make_bfp8_gguf.cpp src/download.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -march=$(MARCH) $< src/download.cpp -o $@ $(LDFLAGS) $(TT_LIBS)
 
@@ -142,7 +121,7 @@ $(BUILD)/test_mesh_overhead: src/tests/test_mesh_overhead.cpp
 
 # Quick smoke test: "The capital of France is" → should output "Paris"
 quicktest: $(BUILD)/test_forward
-	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+	@env TT_METAL_RUNTIME_ROOT=$(_TT_LIBEXEC) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/test_forward \
 		$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
@@ -150,7 +129,7 @@ quicktest: $(BUILD)/test_forward
 
 # Run integration test suite
 test: $(BUILD)/test_inference
-	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) \
+	@env TT_METAL_RUNTIME_ROOT=$(_TT_LIBEXEC) \
 		MODEL_PATH=$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
 		QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \

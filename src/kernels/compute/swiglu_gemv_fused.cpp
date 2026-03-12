@@ -4,11 +4,11 @@
 // Runtime args: [n_act_tiles, Mt_per_core]
 
 #include <cstdint>
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/matmul.h"
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/compute_kernel_api.h"
+#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/matmul.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api.h"
 
 void kernel_main() {
     uint32_t n_act_tiles = get_arg_val<uint32_t>(0);

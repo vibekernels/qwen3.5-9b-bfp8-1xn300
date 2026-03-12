@@ -6,8 +6,8 @@
 // Runtime args: [Mt_per_core]
 
 #include <cstdint>
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/matmul.h"
+#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/matmul.h"
 
 void kernel_main() {
     uint32_t Mt = get_arg_val<uint32_t>(0);

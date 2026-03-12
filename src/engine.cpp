@@ -3773,7 +3773,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         g_mesh2 = MeshDevice::create(
             MeshDeviceConfig(MeshShape(1, 2)),
             DEFAULT_L1_SMALL_SIZE,
-            DEFAULT_TRACE_REGION_SIZE,
+            1 << 25,  // trace_region_size: 32MB (DEFAULT_TRACE_REGION_SIZE is 0 in v0.66+)
             1,  // num_command_queues
             DispatchCoreConfig{DispatchCoreType::WORKER});
         // Create chip 0 and chip 1 submeshes
@@ -3783,7 +3783,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         printf("Opened 2-chip MeshDevice, chip 0 submesh + chip 1 submesh\n");
     } catch (const std::exception& e) {
         printf("Failed to open 1x2 mesh: %s\nFalling back to single chip.\n", e.what());
-        g_mesh = MeshDevice::create_unit_mesh(0);
+        g_mesh = MeshDevice::create_unit_mesh(0, DEFAULT_L1_SMALL_SIZE, 1 << 25);
         g_mesh1 = nullptr;
         g_mesh2 = nullptr;
     }

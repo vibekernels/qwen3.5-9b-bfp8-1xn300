@@ -13,7 +13,7 @@
 //   c_0: input score tiles
 //   c_16: output probability tiles
 
-#include "api/compute/compute_api.h"
+#include "compute_kernel_api.h"
 
 namespace NAMESPACE {
 void MAIN {

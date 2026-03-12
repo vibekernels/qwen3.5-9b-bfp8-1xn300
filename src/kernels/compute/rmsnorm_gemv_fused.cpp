@@ -25,17 +25,17 @@
 //   c_16 (cb_out):    GEMV output tiles
 
 #include <cstdint>
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/matmul.h"
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/eltwise_unary/rsqrt.h"
-#include "api/compute/compute_kernel_api.h"
+#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/matmul.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api/eltwise_unary/rsqrt.h"
+#include "compute_kernel_api.h"
 
 #define REDUCE_OP PoolType::SUM
 #define REDUCE_DIM ReduceDim::REDUCE_SCALAR
-#include "api/compute/reduce.h"
-#include "api/compute/bcast.h"
+#include "compute_kernel_api/reduce.h"
+#include "compute_kernel_api/bcast.h"
 
 void kernel_main() {
     uint32_t Mt = get_arg_val<uint32_t>(0);

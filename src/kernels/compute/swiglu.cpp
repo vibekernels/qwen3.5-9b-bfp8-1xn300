@@ -5,10 +5,10 @@
 // Compile-time args: [num_tiles]
 
 #include <cstdint>
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/compute_kernel_api.h"
+#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api.h"
 
 void kernel_main() {
     constexpr uint32_t num_tiles = get_compile_time_arg_val(0);

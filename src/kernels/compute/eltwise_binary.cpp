@@ -4,8 +4,8 @@
 // Compile-time arg 1: op_type (0 = add, 1 = multiply)
 
 #include <cstdint>
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/tile_move_copy.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/tile_move_copy.h"
 
 void kernel_main() {
     constexpr uint32_t n_tiles = get_compile_time_arg_val(0);
