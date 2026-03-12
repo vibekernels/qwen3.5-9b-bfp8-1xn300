@@ -1,0 +1,896 @@
+[    0.000000] Linux version 6.1.62-tenstorrent-gpu (root@bbdb0c4be185) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #1 SMP Tue Feb  3 09:24:58 UTC 2026
+[    0.000000] Command line: tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k cryptomgr.notests net.ifnames=0 pci=lastbus=0 root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 console=hvc0 console=hvc1 quiet systemd.show_status=false panic=1 nr_cpus=4 selinux=0 systemd.unit=kata-containers.target systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket scsi_mod.scan=none agent.hotplug_timeout=300 systemd.unified_cgroup_hierarchy=0 tenstorrent.async_reset=0 tenstorrent.init=0
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable
+[    0.000000] BIOS-e820: [mem 0x000000000009fc00-0x00000000000fffff] reserved
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x000000007ffdcfff] usable
+[    0.000000] BIOS-e820: [mem 0x000000007ffdd000-0x000000007fffffff] reserved
+[    0.000000] BIOS-e820: [mem 0x00000000b0000000-0x00000000bfffffff] reserved
+[    0.000000] BIOS-e820: [mem 0x00000000fed1c000-0x00000000fed1ffff] reserved
+[    0.000000] BIOS-e820: [mem 0x00000000feffc000-0x00000000feffffff] reserved
+[    0.000000] BIOS-e820: [mem 0x00000000fffc0000-0x00000000ffffffff] reserved
+[    0.000000] BIOS-e820: [mem 0x0000000100000000-0x0000000881ffffff] usable
+[    0.000000] BIOS-e820: [mem 0x000000fd00000000-0x000000ffffffffff] reserved
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] SMBIOS 2.8 present.
+[    0.000000] DMI: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.16.3-0-ga6ed6b701f0a-prebuilt.qemu.org 04/01/2014
+[    0.000000] Hypervisor detected: KVM
+[    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00
+[    0.000000] kvm-clock: using sched offset of 95823666 cycles
+[    0.000002] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.000004] tsc: Detected 2899.998 MHz processor
+[    0.000226] e820: update [mem 0x00000000-0x00000fff] usable ==> reserved
+[    0.000228] e820: remove [mem 0x000a0000-0x000fffff] usable
+[    0.000230] last_pfn = 0x882000 max_arch_pfn = 0x400000000
+[    0.000275] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
+[    0.000283] last_pfn = 0x7ffdd max_arch_pfn = 0x400000000
+[    0.001804] found SMP MP-table at [mem 0x000f53d0-0x000f53df]
+[    0.001812] Using GB pages for direct mapping
+[    0.002019] ACPI: Early table checksum verification disabled
+[    0.002040] ACPI: RSDP 0x00000000000F5390 000014 (v00 BOCHS )
+[    0.002042] ACPI: RSDT 0x000000007FFE3F1F 00003C (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002046] ACPI: FACP 0x000000007FFE3BEF 0000F4 (v03 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002048] ACPI: DSDT 0x000000007FFDFDC0 003E2F (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002050] ACPI: FACS 0x000000007FFDFD80 000040
+[    0.002051] ACPI: APIC 0x000000007FFE3CE3 000090 (v03 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002052] ACPI: HPET 0x000000007FFE3D73 000038 (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002053] ACPI: SRAT 0x000000007FFE3DAB 000110 (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002054] ACPI: MCFG 0x000000007FFE3EBB 00003C (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002055] ACPI: WAET 0x000000007FFE3EF7 000028 (v01 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.002056] ACPI: Reserving FACP table memory at [mem 0x7ffe3bef-0x7ffe3ce2]
+[    0.002057] ACPI: Reserving DSDT table memory at [mem 0x7ffdfdc0-0x7ffe3bee]
+[    0.002057] ACPI: Reserving FACS table memory at [mem 0x7ffdfd80-0x7ffdfdbf]
+[    0.002057] ACPI: Reserving APIC table memory at [mem 0x7ffe3ce3-0x7ffe3d72]
+[    0.002058] ACPI: Reserving HPET table memory at [mem 0x7ffe3d73-0x7ffe3daa]
+[    0.002058] ACPI: Reserving SRAT table memory at [mem 0x7ffe3dab-0x7ffe3eba]
+[    0.002059] ACPI: Reserving MCFG table memory at [mem 0x7ffe3ebb-0x7ffe3ef6]
+[    0.002059] ACPI: Reserving WAET table memory at [mem 0x7ffe3ef7-0x7ffe3f1e]
+[    0.002082] No NUMA configuration found
+[    0.002083] Faking a node at [mem 0x0000000000000000-0x0000000881ffffff]
+[    0.002085] NODE_DATA(0) allocated [mem 0x881ff9000-0x881ffdfff]
+[    0.002099] Zone ranges:
+[    0.002100]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
+[    0.002101]   DMA32    [mem 0x0000000001000000-0x00000000ffffffff]
+[    0.002102]   Normal   [mem 0x0000000100000000-0x0000000881ffffff]
+[    0.002102]   Device   empty
+[    0.002103] Movable zone start for each node
+[    0.002103] Early memory node ranges
+[    0.002103]   node   0: [mem 0x0000000000001000-0x000000000009efff]
+[    0.002104]   node   0: [mem 0x0000000000100000-0x000000007ffdcfff]
+[    0.002105]   node   0: [mem 0x0000000100000000-0x0000000881ffffff]
+[    0.002107] Initmem setup node 0 [mem 0x0000000000001000-0x0000000881ffffff]
+[    0.002251] On node 0, zone DMA: 1 pages in unavailable ranges
+[    0.002262] On node 0, zone DMA: 97 pages in unavailable ranges
+[    0.059032] On node 0, zone Normal: 35 pages in unavailable ranges
+[    0.059140] On node 0, zone Normal: 24576 pages in unavailable ranges
+[    0.061382] ACPI: PM-Timer IO Port: 0x608
+[    0.061390] ACPI: LAPIC_NMI (acpi_id[0xff] dfl dfl lint[0x1])
+[    0.061418] IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23
+[    0.061420] ACPI: INT_SRC_OVR (bus 0 bus_irq 0 global_irq 2 dfl dfl)
+[    0.061421] ACPI: INT_SRC_OVR (bus 0 bus_irq 5 global_irq 5 high level)
+[    0.061422] ACPI: INT_SRC_OVR (bus 0 bus_irq 9 global_irq 9 high level)
+[    0.061423] ACPI: INT_SRC_OVR (bus 0 bus_irq 10 global_irq 10 high level)
+[    0.061423] ACPI: INT_SRC_OVR (bus 0 bus_irq 11 global_irq 11 high level)
+[    0.061425] ACPI: Using ACPI (MADT) for SMP configuration information
+[    0.061426] ACPI: HPET id: 0x8086a201 base: 0xfed00000
+[    0.061429] TSC deadline timer available
+[    0.061431] smpboot: Allowing 4 CPUs, 0 hotplug CPUs
+[    0.061445] kvm-guest: KVM setup pv remote TLB flush
+[    0.061448] kvm-guest: setup PV sched yield
+[    0.061454] [mem 0xc0000000-0xfed1bfff] available for PCI devices
+[    0.061455] Booting paravirtualized kernel on KVM
+[    0.061456] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
+[    0.063951] setup_percpu: NR_CPUS:240 nr_cpumask_bits:4 nr_cpu_ids:4 nr_node_ids:1
+[    0.064133] percpu: Embedded 44 pages/cpu s143016 r8192 d29016 u524288
+[    0.064136] pcpu-alloc: s143016 r8192 d29016 u524288 alloc=1*2097152
+[    0.064138] pcpu-alloc: [0] 0 1 2 3 
+[    0.064164] Fallback order for Node 0: 0 
+[    0.064166] Built 1 zonelists, mobility grouping on.  Total pages: 8265309
+[    0.064167] Policy zone: Normal
+[    0.064167] Kernel command line: tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k cryptomgr.notests net.ifnames=0 pci=lastbus=0 root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 console=hvc0 console=hvc1 quiet systemd.show_status=false panic=1 nr_cpus=4 selinux=0 systemd.unit=kata-containers.target systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket scsi_mod.scan=none agent.hotplug_timeout=300 systemd.unified_cgroup_hierarchy=0 tenstorrent.async_reset=0 tenstorrent.init=0
+[    0.066906] Dentry cache hash table entries: 4194304 (order: 13, 33554432 bytes, linear)
+[    0.068326] Inode-cache hash table entries: 2097152 (order: 12, 16777216 bytes, linear)
+[    0.068350] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.068352] software IO TLB: area num 4.
+[    0.101036] Memory: 32918588K/33586668K available (12289K kernel code, 1062K rwdata, 2428K rodata, 964K init, 888K bss, 667824K reserved, 0K cma-reserved)
+[    0.101061] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=4, Nodes=1
+[    0.101234] rcu: Hierarchical RCU implementation.
+[    0.101235] rcu: 	RCU restricting CPUs from NR_CPUS=240 to nr_cpu_ids=4.
+[    0.101236] 	All grace periods are expedited (rcu_expedited).
+[    0.101237] 	Tracing variant of Tasks RCU enabled.
+[    0.101237] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+[    0.101238] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=4
+[    0.101241] NR_IRQS: 15616, nr_irqs: 456, preallocated irqs: 16
+[    0.101397] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.101437] Console: colour dummy device 80x25
+[    0.101446] ACPI: Core revision 20220331
+[    0.101580] clocksource: hpet: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604467 ns
+[    0.101701] APIC: Switch to symmetric I/O mode setup
+[    0.101887] x2apic enabled
+[    0.102096] Switched APIC routing to physical x2apic.
+[    0.102098] kvm-guest: setup PV IPIs
+[    0.103101] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+[    0.103122] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x29cd4133323, max_idle_ns: 440795296220 ns
+[    0.103124] Calibrating delay loop (skipped) preset value.. 5799.99 BogoMIPS (lpj=11599992)
+[    0.103203] x86/cpu: User Mode Instruction Prevention (UMIP) activated
+[    0.103261] Last level iTLB entries: 4KB 512, 2MB 255, 4MB 127
+[    0.103262] Last level dTLB entries: 4KB 512, 2MB 255, 4MB 127, 1GB 0
+[    0.103263] Spectre V1 : Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+[    0.103266] Spectre V2 : Mitigation: Retpolines
+[    0.103266] Spectre V2 : Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch
+[    0.103266] Spectre V2 : Spectre v2 / SpectreRSB : Filling RSB on VMEXIT
+[    0.103267] Spectre V2 : Enabling Restricted Speculation for firmware calls
+[    0.103268] Spectre V2 : mitigation: Enabling conditional Indirect Branch Prediction Barrier
+[    0.103270] Speculative Store Bypass: Mitigation: Speculative Store Bypass disabled via prctl
+[    0.103271] Speculative Return Stack Overflow: WARNING: kernel not compiled with CPU_SRSO.
+[    0.103295] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'
+[    0.103302] x86/fpu: Supporting XSAVE feature 0x002: 'SSE registers'
+[    0.103302] x86/fpu: Supporting XSAVE feature 0x004: 'AVX registers'
+[    0.103302] x86/fpu: Supporting XSAVE feature 0x020: 'AVX-512 opmask'
+[    0.103303] x86/fpu: Supporting XSAVE feature 0x040: 'AVX-512 Hi256'
+[    0.103303] x86/fpu: Supporting XSAVE feature 0x080: 'AVX-512 ZMM_Hi256'
+[    0.103303] x86/fpu: Supporting XSAVE feature 0x200: 'Protection Keys User registers'
+[    0.103304] x86/fpu: xstate_offset[2]:  576, xstate_sizes[2]:  256
+[    0.103305] x86/fpu: xstate_offset[5]:  832, xstate_sizes[5]:   64
+[    0.103305] x86/fpu: xstate_offset[6]:  896, xstate_sizes[6]:  512
+[    0.103305] x86/fpu: xstate_offset[7]: 1408, xstate_sizes[7]: 1024
+[    0.103306] x86/fpu: xstate_offset[9]: 2432, xstate_sizes[9]:    8
+[    0.103306] x86/fpu: Enabled xstate features 0x2e7, context size is 2440 bytes, using 'compacted' format.
+[    0.104027] Freeing SMP alternatives memory: 36K
+[    0.104028] pid_max: default: 32768 minimum: 301
+[    0.104034] LSM: Security Framework initializing
+[    0.104056] Mount-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.104066] Mountpoint-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.104375] smpboot: CPU0: AMD EPYC 9254 24-Core Processor (family: 0x19, model: 0x11, stepping: 0x1)
+[    0.104440] cblist_init_generic: Setting adjustable number of callback queues.
+[    0.104441] cblist_init_generic: Setting shift to 2 and lim to 1.
+[    0.104448] Performance Events: Fam17h+ core perfctr, AMD PMU driver.
+[    0.104471] ... version:                0
+[    0.104472] ... bit width:              48
+[    0.104472] ... generic registers:      6
+[    0.104473] ... value mask:             0000ffffffffffff
+[    0.104473] ... max period:             00007fffffffffff
+[    0.104473] ... fixed-purpose events:   0
+[    0.104474] ... event mask:             000000000000003f
+[    0.104528] signal: max sigframe size: 2976
+[    0.104538] rcu: Hierarchical SRCU implementation.
+[    0.104538] rcu: 	Max phase no-delay instances is 1000.
+[    0.104580] smp: Bringing up secondary CPUs ...
+[    0.104631] x86: Booting SMP configuration:
+[    0.104631] .... node  #0, CPUs:      #1 #2 #3
+[    0.104979] smp: Brought up 1 node, 4 CPUs
+[    0.104979] smpboot: Max logical packages: 4
+[    0.104979] smpboot: Total of 4 processors activated (23199.98 BogoMIPS)
+[    0.104979] devtmpfs: initialized
+[    0.104979] x86/mm: Memory block size: 128MB
+[    0.104979] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+[    0.104979] futex hash table entries: 1024 (order: 4, 65536 bytes, linear)
+[    0.104979] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.104979] audit: initializing netlink subsys (disabled)
+[    0.104979] audit: type=2000 audit(1773344833.469:1): state=initialized audit_enabled=0 res=1
+[    0.104979] thermal_sys: Registered thermal governor 'step_wise'
+[    0.104979] cpuidle: using governor menu
+[    0.104979] acpiphp: ACPI Hot Plug PCI Controller Driver version: 0.5
+[    0.104979] PCI: MMCONFIG for domain 0000 [bus 00-ff] at [mem 0xb0000000-0xbfffffff] (base 0xb0000000)
+[    0.104979] PCI: MMCONFIG at [mem 0xb0000000-0xbfffffff] reserved in E820
+[    0.104979] PCI: Using configuration type 1 for base access
+[    0.107199] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages
+[    0.107199] HugeTLB: 16380 KiB vmemmap can be freed for a 1.00 GiB page
+[    0.107199] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+[    0.107199] HugeTLB: 28 KiB vmemmap can be freed for a 2.00 MiB page
+[    0.107199] cryptd: max_cpu_qlen set to 1000
+[    0.107199] ACPI: Added _OSI(Module Device)
+[    0.107199] ACPI: Added _OSI(Processor Device)
+[    0.107199] ACPI: Added _OSI(3.0 _SCP Extensions)
+[    0.107199] ACPI: Added _OSI(Processor Aggregator Device)
+[    0.107661] ACPI: 1 ACPI AML tables successfully acquired and loaded
+[    0.108778] ACPI: Interpreter enabled
+[    0.108781] ACPI: PM: (supports S0 S5)
+[    0.108781] ACPI: Using IOAPIC for interrupt routing
+[    0.108789] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+[    0.108789] PCI: Using E820 reservations for host bridge windows
+[    0.108851] ACPI: Enabled 3 GPEs in block 00 to 3F
+[    0.110342] ACPI: PCI Root Bridge [PCI0] (domain 0000 [bus 00-ff])
+[    0.110346] acpi PNP0A08:00: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI HPX-Type3]
+[    0.110360] acpi PNP0A08:00: _OSC: platform does not support [PCIeHotplug LTR]
+[    0.110377] acpi PNP0A08:00: _OSC: OS now controls [SHPCHotplug PME PCIeCapability]
+[    0.110580] PCI host bridge to bus 0000:00
+[    0.110581] pci_bus 0000:00: root bus resource [io  0x0000-0x0cf7 window]
+[    0.110582] pci_bus 0000:00: root bus resource [io  0x0d00-0xffff window]
+[    0.110582] pci_bus 0000:00: root bus resource [mem 0x000a0000-0x000bffff window]
+[    0.110583] pci_bus 0000:00: root bus resource [mem 0x80000000-0xafffffff window]
+[    0.110583] pci_bus 0000:00: root bus resource [mem 0xc0000000-0xfebfffff window]
+[    0.110584] pci_bus 0000:00: root bus resource [mem 0x380000000000-0x384000217fff window]
+[    0.110584] pci_bus 0000:00: root bus resource [bus 00-ff]
+[    0.110620] pci 0000:00:00.0: [8086:29c0] type 00 class 0x060000
+[    0.111277] pci 0000:00:01.0: [1af4:1003] type 00 class 0x078000
+[    0.113392] pci 0000:00:01.0: reg 0x10: [io  0xd080-0xd0bf]
+[    0.115129] pci 0000:00:01.0: reg 0x14: [mem 0xfea40000-0xfea40fff]
+[    0.120580] pci 0000:00:01.0: reg 0x20: [mem 0x384000200000-0x384000203fff 64bit pref]
+[    0.121887] pci 0000:00:02.0: [1b36:0001] type 01 class 0x060400
+[    0.124537] pci 0000:00:03.0: [1af4:1001] type 00 class 0x010000
+[    0.126673] pci 0000:00:03.0: reg 0x10: [io  0xd000-0xd07f]
+[    0.128279] pci 0000:00:03.0: reg 0x14: [mem 0xfea41000-0xfea41fff]
+[    0.133109] pci 0000:00:03.0: reg 0x20: [mem 0x384000204000-0x384000207fff 64bit pref]
+[    0.135269] pci 0000:00:04.0: [1af4:1004] type 00 class 0x010000
+[    0.136682] pci 0000:00:04.0: reg 0x10: [io  0xd0c0-0xd0ff]
+[    0.138122] pci 0000:00:04.0: reg 0x14: [mem 0xfea42000-0xfea42fff]
+[    0.143129] pci 0000:00:04.0: reg 0x20: [mem 0x384000208000-0x38400020bfff 64bit pref]
+[    0.144899] pci 0000:00:05.0: [1af4:1005] type 00 class 0x00ff00
+[    0.146133] pci 0000:00:05.0: reg 0x10: [io  0xd180-0xd19f]
+[    0.147129] pci 0000:00:05.0: reg 0x14: [mem 0xfea43000-0xfea43fff]
+[    0.151132] pci 0000:00:05.0: reg 0x20: [mem 0x38400020c000-0x38400020ffff 64bit pref]
+[    0.154942] pci 0000:00:06.0: [1b36:000c] type 01 class 0x060400
+[    0.156090] pci 0000:00:06.0: reg 0x10: [mem 0xfea44000-0xfea44fff]
+[    0.158179] pci 0000:00:06.0: enabling Extended Tags
+[    0.158694] pci 0000:00:07.0: [1b36:000c] type 01 class 0x060400
+[    0.159908] pci 0000:00:07.0: reg 0x10: [mem 0xfea45000-0xfea45fff]
+[    0.161905] pci 0000:00:07.0: enabling Extended Tags
+[    0.162439] pci 0000:00:08.0: [1b36:000c] type 01 class 0x060400
+[    0.165723] pci 0000:00:08.0: reg 0x10: [mem 0xfea46000-0xfea46fff]
+[    0.167570] pci 0000:00:08.0: enabling Extended Tags
+[    0.168089] pci 0000:00:09.0: [1b36:000c] type 01 class 0x060400
+[    0.169196] pci 0000:00:09.0: reg 0x10: [mem 0xfea47000-0xfea47fff]
+[    0.171032] pci 0000:00:09.0: enabling Extended Tags
+[    0.171554] pci 0000:00:0a.0: [1b36:000c] type 01 class 0x060400
+[    0.172693] pci 0000:00:0a.0: reg 0x10: [mem 0xfea48000-0xfea48fff]
+[    0.174675] pci 0000:00:0a.0: enabling Extended Tags
+[    0.175191] pci 0000:00:0b.0: [1b36:000c] type 01 class 0x060400
+[    0.178693] pci 0000:00:0b.0: reg 0x10: [mem 0xfea49000-0xfea49fff]
+[    0.180270] pci 0000:00:0b.0: enabling Extended Tags
+[    0.180793] pci 0000:00:0c.0: [1b36:000c] type 01 class 0x060400
+[    0.181844] pci 0000:00:0c.0: reg 0x10: [mem 0xfea4a000-0xfea4afff]
+[    0.183589] pci 0000:00:0c.0: enabling Extended Tags
+[    0.184101] pci 0000:00:0d.0: [1b36:000c] type 01 class 0x060400
+[    0.185214] pci 0000:00:0d.0: reg 0x10: [mem 0xfea4b000-0xfea4bfff]
+[    0.189556] pci 0000:00:0d.0: enabling Extended Tags
+[    0.190116] pci 0000:00:0e.0: [1af4:1053] type 00 class 0x078000
+[    0.191471] pci 0000:00:0e.0: reg 0x14: [mem 0xfea4c000-0xfea4cfff]
+[    0.193475] pci 0000:00:0e.0: reg 0x20: [mem 0x384000210000-0x384000213fff 64bit pref]
+[    0.194606] pci 0000:00:0f.0: [1af4:1000] type 00 class 0x020000
+[    0.195718] pci 0000:00:0f.0: reg 0x10: [io  0xd100-0xd13f]
+[    0.196695] pci 0000:00:0f.0: reg 0x14: [mem 0xfea4d000-0xfea4dfff]
+[    0.202234] pci 0000:00:0f.0: reg 0x20: [mem 0x384000214000-0x384000217fff 64bit pref]
+[    0.203128] pci 0000:00:0f.0: reg 0x30: [mem 0xfea00000-0xfea3ffff pref]
+[    0.203633] pci 0000:00:1f.0: [8086:2918] type 00 class 0x060100
+[    0.204008] pci 0000:00:1f.0: quirk: [io  0x0600-0x067f] claimed by ICH6 ACPI/GPIO/TCO
+[    0.204173] pci 0000:00:1f.2: [8086:2922] type 00 class 0x010601
+[    0.207465] pci 0000:00:1f.2: reg 0x20: [io  0xd1a0-0xd1bf]
+[    0.208088] pci 0000:00:1f.2: reg 0x24: [mem 0xfea4e000-0xfea4efff]
+[    0.208985] pci 0000:00:1f.3: [8086:2930] type 00 class 0x0c0500
+[    0.210941] pci 0000:00:1f.3: reg 0x20: [io  0x0700-0x073f]
+[    0.214801] pci_bus 0000:01: extended config space not accessible
+[    0.214871] acpiphp: Slot [0] registered
+[    0.214882] acpiphp: Slot [1] registered
+[    0.214891] acpiphp: Slot [2] registered
+[    0.214900] acpiphp: Slot [3] registered
+[    0.214908] acpiphp: Slot [4] registered
+[    0.214917] acpiphp: Slot [5] registered
+[    0.214926] acpiphp: Slot [6] registered
+[    0.214935] acpiphp: Slot [7] registered
+[    0.214943] acpiphp: Slot [8] registered
+[    0.214952] acpiphp: Slot [9] registered
+[    0.214961] acpiphp: Slot [10] registered
+[    0.214969] acpiphp: Slot [11] registered
+[    0.214978] acpiphp: Slot [12] registered
+[    0.214986] acpiphp: Slot [13] registered
+[    0.214995] acpiphp: Slot [14] registered
+[    0.215003] acpiphp: Slot [15] registered
+[    0.215012] acpiphp: Slot [16] registered
+[    0.215021] acpiphp: Slot [17] registered
+[    0.215030] acpiphp: Slot [18] registered
+[    0.215038] acpiphp: Slot [19] registered
+[    0.215047] acpiphp: Slot [20] registered
+[    0.215065] acpiphp: Slot [21] registered
+[    0.215074] acpiphp: Slot [22] registered
+[    0.215083] acpiphp: Slot [23] registered
+[    0.215092] acpiphp: Slot [24] registered
+[    0.215100] acpiphp: Slot [25] registered
+[    0.215109] acpiphp: Slot [26] registered
+[    0.215117] acpiphp: Slot [27] registered
+[    0.215130] acpiphp: Slot [28] registered
+[    0.215138] acpiphp: Slot [29] registered
+[    0.215147] acpiphp: Slot [30] registered
+[    0.215155] acpiphp: Slot [31] registered
+[    0.215355] pci 0000:00:02.0: PCI bridge to [bus 01]
+[    0.215369] pci 0000:00:02.0:   bridge window [io  0xc000-0xcfff]
+[    0.215382] pci 0000:00:02.0:   bridge window [mem 0xfe800000-0xfe9fffff]
+[    0.215406] pci 0000:00:02.0:   bridge window [mem 0x384000000000-0x3840001fffff 64bit pref]
+[    0.215941] acpiphp: Slot [0-2] registered
+[    0.215955] pci 0000:00:06.0: PCI bridge to [bus 02]
+[    0.215979] pci 0000:00:06.0:   bridge window [mem 0xfe400000-0xfe7fffff]
+[    0.216004] pci 0000:00:06.0:   bridge window [mem 0x383800000000-0x383fffffffff 64bit pref]
+[    0.216512] acpiphp: Slot [0-3] registered
+[    0.216525] pci 0000:00:07.0: PCI bridge to [bus 03]
+[    0.216550] pci 0000:00:07.0:   bridge window [mem 0xfe000000-0xfe3fffff]
+[    0.216574] pci 0000:00:07.0:   bridge window [mem 0x383000000000-0x3837ffffffff 64bit pref]
+[    0.217091] acpiphp: Slot [0-4] registered
+[    0.217104] pci 0000:00:08.0: PCI bridge to [bus 04]
+[    0.217128] pci 0000:00:08.0:   bridge window [mem 0xfdc00000-0xfdffffff]
+[    0.217153] pci 0000:00:08.0:   bridge window [mem 0x382800000000-0x382fffffffff 64bit pref]
+[    0.217666] acpiphp: Slot [0-5] registered
+[    0.217679] pci 0000:00:09.0: PCI bridge to [bus 05]
+[    0.217703] pci 0000:00:09.0:   bridge window [mem 0xfd800000-0xfdbfffff]
+[    0.217727] pci 0000:00:09.0:   bridge window [mem 0x382000000000-0x3827ffffffff 64bit pref]
+[    0.218259] acpiphp: Slot [0-6] registered
+[    0.218272] pci 0000:00:0a.0: PCI bridge to [bus 06]
+[    0.218296] pci 0000:00:0a.0:   bridge window [mem 0xfd400000-0xfd7fffff]
+[    0.218320] pci 0000:00:0a.0:   bridge window [mem 0x381800000000-0x381fffffffff 64bit pref]
+[    0.218812] acpiphp: Slot [0-7] registered
+[    0.218825] pci 0000:00:0b.0: PCI bridge to [bus 07]
+[    0.218849] pci 0000:00:0b.0:   bridge window [mem 0xfd000000-0xfd3fffff]
+[    0.218874] pci 0000:00:0b.0:   bridge window [mem 0x381000000000-0x3817ffffffff 64bit pref]
+[    0.219272] acpiphp: Slot [0-8] registered
+[    0.219285] pci 0000:00:0c.0: PCI bridge to [bus 08]
+[    0.219309] pci 0000:00:0c.0:   bridge window [mem 0xfcc00000-0xfcffffff]
+[    0.219334] pci 0000:00:0c.0:   bridge window [mem 0x380800000000-0x380fffffffff 64bit pref]
+[    0.219824] acpiphp: Slot [0-9] registered
+[    0.219838] pci 0000:00:0d.0: PCI bridge to [bus 09]
+[    0.219862] pci 0000:00:0d.0:   bridge window [mem 0xfc800000-0xfcbfffff]
+[    0.219887] pci 0000:00:0d.0:   bridge window [mem 0x380000000000-0x3807ffffffff 64bit pref]
+[    0.223127] pci_bus 0000:00: on NUMA node 0
+[    0.223231] ACPI: PCI: Interrupt link LNKA configured for IRQ 10
+[    0.223275] ACPI: PCI: Interrupt link LNKB configured for IRQ 10
+[    0.223313] ACPI: PCI: Interrupt link LNKC configured for IRQ 11
+[    0.223351] ACPI: PCI: Interrupt link LNKD configured for IRQ 11
+[    0.223388] ACPI: PCI: Interrupt link LNKE configured for IRQ 10
+[    0.223425] ACPI: PCI: Interrupt link LNKF configured for IRQ 10
+[    0.223469] ACPI: PCI: Interrupt link LNKG configured for IRQ 11
+[    0.223507] ACPI: PCI: Interrupt link LNKH configured for IRQ 11
+[    0.223525] ACPI: PCI: Interrupt link GSIA configured for IRQ 16
+[    0.223527] ACPI: PCI: Interrupt link GSIB configured for IRQ 17
+[    0.223530] ACPI: PCI: Interrupt link GSIC configured for IRQ 18
+[    0.223532] ACPI: PCI: Interrupt link GSID configured for IRQ 19
+[    0.223534] ACPI: PCI: Interrupt link GSIE configured for IRQ 20
+[    0.223536] ACPI: PCI: Interrupt link GSIF configured for IRQ 21
+[    0.223538] ACPI: PCI: Interrupt link GSIG configured for IRQ 22
+[    0.223541] ACPI: PCI: Interrupt link GSIH configured for IRQ 23
+[    0.223808] iommu: Default domain type: Translated 
+[    0.223808] iommu: DMA domain TLB invalidation policy: lazy mode 
+[    0.223849] SCSI subsystem initialized
+[    0.223852] pps_core: LinuxPPS API ver. 1 registered
+[    0.223852] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    0.223853] PTP clock support registered
+[    0.223904] PCI: Using ACPI for IRQ routing
+[    0.223905] PCI: pci_cache_line_size set to 64 bytes
+[    0.226062] e820: reserve RAM buffer [mem 0x0009fc00-0x0009ffff]
+[    0.226063] e820: reserve RAM buffer [mem 0x7ffdd000-0x7fffffff]
+[    0.226064] e820: reserve RAM buffer [mem 0x882000000-0x883ffffff]
+[    0.226095] vgaarb: loaded
+[    0.226095] clocksource: Switched to clocksource kvm-clock
+[    0.226095] pnp: PnP ACPI init
+[    0.226095] system 00:03: [mem 0xb0000000-0xbfffffff window] has been reserved
+[    0.226095] pnp: PnP ACPI: found 4 devices
+[    0.229428] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+[    0.229444] NET: Registered PF_INET protocol family
+[    0.229655] IP idents hash table entries: 262144 (order: 9, 2097152 bytes, linear)
+[    0.231395] tcp_listen_portaddr_hash hash table entries: 16384 (order: 6, 262144 bytes, linear)
+[    0.231409] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.231412] TCP established hash table entries: 262144 (order: 9, 2097152 bytes, linear)
+[    0.231655] TCP bind hash table entries: 65536 (order: 9, 2097152 bytes, linear)
+[    0.231869] TCP: Hash tables configured (established 262144 bind 65536)
+[    0.231882] UDP hash table entries: 16384 (order: 7, 524288 bytes, linear)
+[    0.231911] UDP-Lite hash table entries: 16384 (order: 7, 524288 bytes, linear)
+[    0.232090] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.232097] pci 0000:00:06.0: bridge window [io  0x1000-0x0fff] to [bus 02] add_size 1000
+[    0.232099] pci 0000:00:07.0: bridge window [io  0x1000-0x0fff] to [bus 03] add_size 1000
+[    0.232100] pci 0000:00:08.0: bridge window [io  0x1000-0x0fff] to [bus 04] add_size 1000
+[    0.232100] pci 0000:00:09.0: bridge window [io  0x1000-0x0fff] to [bus 05] add_size 1000
+[    0.232101] pci 0000:00:0a.0: bridge window [io  0x1000-0x0fff] to [bus 06] add_size 1000
+[    0.232101] pci 0000:00:0b.0: bridge window [io  0x1000-0x0fff] to [bus 07] add_size 1000
+[    0.232102] pci 0000:00:0c.0: bridge window [io  0x1000-0x0fff] to [bus 08] add_size 1000
+[    0.232102] pci 0000:00:0d.0: bridge window [io  0x1000-0x0fff] to [bus 09] add_size 1000
+[    0.232106] pci 0000:00:06.0: BAR 7: assigned [io  0x1000-0x1fff]
+[    0.232107] pci 0000:00:07.0: BAR 7: assigned [io  0x2000-0x2fff]
+[    0.232108] pci 0000:00:08.0: BAR 7: assigned [io  0x3000-0x3fff]
+[    0.232108] pci 0000:00:09.0: BAR 7: assigned [io  0x4000-0x4fff]
+[    0.232109] pci 0000:00:0a.0: BAR 7: assigned [io  0x5000-0x5fff]
+[    0.232110] pci 0000:00:0b.0: BAR 7: assigned [io  0x6000-0x6fff]
+[    0.232110] pci 0000:00:0c.0: BAR 7: assigned [io  0x7000-0x7fff]
+[    0.232111] pci 0000:00:0d.0: BAR 7: assigned [io  0x8000-0x8fff]
+[    0.232112] pci 0000:00:02.0: PCI bridge to [bus 01]
+[    0.232123] pci 0000:00:02.0:   bridge window [io  0xc000-0xcfff]
+[    0.232796] pci 0000:00:02.0:   bridge window [mem 0xfe800000-0xfe9fffff]
+[    0.233146] pci 0000:00:02.0:   bridge window [mem 0x384000000000-0x3840001fffff 64bit pref]
+[    0.233851] pci 0000:00:06.0: PCI bridge to [bus 02]
+[    0.233859] pci 0000:00:06.0:   bridge window [io  0x1000-0x1fff]
+[    0.234409] pci 0000:00:06.0:   bridge window [mem 0xfe400000-0xfe7fffff]
+[    0.234759] pci 0000:00:06.0:   bridge window [mem 0x383800000000-0x383fffffffff 64bit pref]
+[    0.235399] pci 0000:00:07.0: PCI bridge to [bus 03]
+[    0.235406] pci 0000:00:07.0:   bridge window [io  0x2000-0x2fff]
+[    0.235931] pci 0000:00:07.0:   bridge window [mem 0xfe000000-0xfe3fffff]
+[    0.236258] pci 0000:00:07.0:   bridge window [mem 0x383000000000-0x3837ffffffff 64bit pref]
+[    0.236913] pci 0000:00:08.0: PCI bridge to [bus 04]
+[    0.236920] pci 0000:00:08.0:   bridge window [io  0x3000-0x3fff]
+[    0.237404] pci 0000:00:08.0:   bridge window [mem 0xfdc00000-0xfdffffff]
+[    0.237760] pci 0000:00:08.0:   bridge window [mem 0x382800000000-0x382fffffffff 64bit pref]
+[    0.238398] pci 0000:00:09.0: PCI bridge to [bus 05]
+[    0.238405] pci 0000:00:09.0:   bridge window [io  0x4000-0x4fff]
+[    0.238878] pci 0000:00:09.0:   bridge window [mem 0xfd800000-0xfdbfffff]
+[    0.239190] pci 0000:00:09.0:   bridge window [mem 0x382000000000-0x3827ffffffff 64bit pref]
+[    0.239938] pci 0000:00:0a.0: PCI bridge to [bus 06]
+[    0.239945] pci 0000:00:0a.0:   bridge window [io  0x5000-0x5fff]
+[    0.240490] pci 0000:00:0a.0:   bridge window [mem 0xfd400000-0xfd7fffff]
+[    0.240814] pci 0000:00:0a.0:   bridge window [mem 0x381800000000-0x381fffffffff 64bit pref]
+[    0.242368] pci 0000:00:0b.0: PCI bridge to [bus 07]
+[    0.242376] pci 0000:00:0b.0:   bridge window [io  0x6000-0x6fff]
+[    0.245317] pci 0000:00:0b.0:   bridge window [mem 0xfd000000-0xfd3fffff]
+[    0.247032] pci 0000:00:0b.0:   bridge window [mem 0x381000000000-0x3817ffffffff 64bit pref]
+[    0.247754] pci 0000:00:0c.0: PCI bridge to [bus 08]
+[    0.247772] pci 0000:00:0c.0:   bridge window [io  0x7000-0x7fff]
+[    0.248300] pci 0000:00:0c.0:   bridge window [mem 0xfcc00000-0xfcffffff]
+[    0.248654] pci 0000:00:0c.0:   bridge window [mem 0x380800000000-0x380fffffffff 64bit pref]
+[    0.249391] pci 0000:00:0d.0: PCI bridge to [bus 09]
+[    0.249399] pci 0000:00:0d.0:   bridge window [io  0x8000-0x8fff]
+[    0.249931] pci 0000:00:0d.0:   bridge window [mem 0xfc800000-0xfcbfffff]
+[    0.250278] pci 0000:00:0d.0:   bridge window [mem 0x380000000000-0x3807ffffffff 64bit pref]
+[    0.251058] pci_bus 0000:00: resource 4 [io  0x0000-0x0cf7 window]
+[    0.251059] pci_bus 0000:00: resource 5 [io  0x0d00-0xffff window]
+[    0.251060] pci_bus 0000:00: resource 6 [mem 0x000a0000-0x000bffff window]
+[    0.251060] pci_bus 0000:00: resource 7 [mem 0x80000000-0xafffffff window]
+[    0.251061] pci_bus 0000:00: resource 8 [mem 0xc0000000-0xfebfffff window]
+[    0.251061] pci_bus 0000:00: resource 9 [mem 0x380000000000-0x384000217fff window]
+[    0.251062] pci_bus 0000:01: resource 0 [io  0xc000-0xcfff]
+[    0.251062] pci_bus 0000:01: resource 1 [mem 0xfe800000-0xfe9fffff]
+[    0.251063] pci_bus 0000:01: resource 2 [mem 0x384000000000-0x3840001fffff 64bit pref]
+[    0.251064] pci_bus 0000:02: resource 0 [io  0x1000-0x1fff]
+[    0.251064] pci_bus 0000:02: resource 1 [mem 0xfe400000-0xfe7fffff]
+[    0.251065] pci_bus 0000:02: resource 2 [mem 0x383800000000-0x383fffffffff 64bit pref]
+[    0.251065] pci_bus 0000:03: resource 0 [io  0x2000-0x2fff]
+[    0.251066] pci_bus 0000:03: resource 1 [mem 0xfe000000-0xfe3fffff]
+[    0.251066] pci_bus 0000:03: resource 2 [mem 0x383000000000-0x3837ffffffff 64bit pref]
+[    0.251067] pci_bus 0000:04: resource 0 [io  0x3000-0x3fff]
+[    0.251067] pci_bus 0000:04: resource 1 [mem 0xfdc00000-0xfdffffff]
+[    0.251067] pci_bus 0000:04: resource 2 [mem 0x382800000000-0x382fffffffff 64bit pref]
+[    0.251068] pci_bus 0000:05: resource 0 [io  0x4000-0x4fff]
+[    0.251068] pci_bus 0000:05: resource 1 [mem 0xfd800000-0xfdbfffff]
+[    0.251069] pci_bus 0000:05: resource 2 [mem 0x382000000000-0x3827ffffffff 64bit pref]
+[    0.251070] pci_bus 0000:06: resource 0 [io  0x5000-0x5fff]
+[    0.251070] pci_bus 0000:06: resource 1 [mem 0xfd400000-0xfd7fffff]
+[    0.251070] pci_bus 0000:06: resource 2 [mem 0x381800000000-0x381fffffffff 64bit pref]
+[    0.251071] pci_bus 0000:07: resource 0 [io  0x6000-0x6fff]
+[    0.251072] pci_bus 0000:07: resource 1 [mem 0xfd000000-0xfd3fffff]
+[    0.251072] pci_bus 0000:07: resource 2 [mem 0x381000000000-0x3817ffffffff 64bit pref]
+[    0.251073] pci_bus 0000:08: resource 0 [io  0x7000-0x7fff]
+[    0.251073] pci_bus 0000:08: resource 1 [mem 0xfcc00000-0xfcffffff]
+[    0.251073] pci_bus 0000:08: resource 2 [mem 0x380800000000-0x380fffffffff 64bit pref]
+[    0.251074] pci_bus 0000:09: resource 0 [io  0x8000-0x8fff]
+[    0.251074] pci_bus 0000:09: resource 1 [mem 0xfc800000-0xfcbfffff]
+[    0.251075] pci_bus 0000:09: resource 2 [mem 0x380000000000-0x3807ffffffff 64bit pref]
+[    0.251217] PCI: CLS 0 bytes, default 64
+[    0.251226] PCI-DMA: Using software bounce buffering for IO (SWIOTLB)
+[    0.251226] software IO TLB: mapped [mem 0x000000007bfdd000-0x000000007ffdd000] (64MB)
+[    0.251252] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x29cd4133323, max_idle_ns: 440795296220 ns
+[    0.252020] Initialise system trusted keyrings
+[    0.252075] workingset: timestamp_bits=40 max_order=23 bucket_order=0
+[    0.252648] fuse: init (API version 7.37)
+[    0.252688] SGI XFS with security attributes, no debug enabled
+[    0.252873] 9p: Installing v9fs 9p2000 file system support
+[    0.255149] NET: Registered PF_ALG protocol family
+[    0.255150] Key type asymmetric registered
+[    0.255151] Asymmetric key parser 'x509' registered
+[    0.255158] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 249)
+[    0.255729] alg: self-tests disabled
+[    0.255924] ACPI: \_SB_.GSIG: Enabled at IRQ 22
+[    0.258496] ACPI: \_SB_.GSIH: Enabled at IRQ 23
+[    0.259589] ACPI: \_SB_.GSIE: Enabled at IRQ 20
+[    0.260616] ACPI: \_SB_.GSIF: Enabled at IRQ 21
+[    0.265492] shpchp: Standard Hot Plug PCI Controller Driver version: 0.4
+[    0.265523] input: Power Button as /devices/LNXSYSTM:00/LNXPWRBN:00/input/input0
+[    0.265525] ACPI: button: Power Button [PWRF]
+[    0.271282] Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
+[    0.280537] printk: console [hvc0] enabled
+[    0.280933] random: crng init done
+[    0.281666] brd: module loaded
+[    0.282204] loop: module loaded
+[    0.282288] virtio_blk virtio1: 4/0/0 default/read/poll queues
+[    0.283090] virtio_blk virtio1: [vda] 1835008 512-byte logical blocks (940 MB/896 MiB)
+[    0.283684]  vda: vda1
+[    0.284892] scsi host0: Virtio SCSI HBA
+[    0.296934] tun: Universal TUN/TAP device driver, 1.6
+[    0.299737] VFIO - User Level meta-driver version: 0.3
+[    0.300378] xt_time: kernel timezone is -0000
+[    0.300384] IPVS: Registered protocols (TCP, UDP, SCTP, AH, ESP)
+[    0.300392] IPVS: Connection hash table configured (size=4096, memory=32Kbytes)
+[    0.300411] IPVS: ipvs loaded.
+[    0.300412] IPVS: [rr] scheduler registered.
+[    0.300412] IPVS: [wrr] scheduler registered.
+[    0.300413] IPVS: [lc] scheduler registered.
+[    0.300414] IPVS: [wlc] scheduler registered.
+[    0.300414] IPVS: [fo] scheduler registered.
+[    0.300415] IPVS: [ovf] scheduler registered.
+[    0.300416] IPVS: [lblc] scheduler registered.
+[    0.300417] IPVS: [lblcr] scheduler registered.
+[    0.300418] IPVS: [dh] scheduler registered.
+[    0.300418] IPVS: [sh] scheduler registered.
+[    0.300419] IPVS: [sed] scheduler registered.
+[    0.300419] IPVS: [nq] scheduler registered.
+[    0.300420] IPVS: [sip] pe registered.
+[    0.300449] Initializing XFRM netlink socket
+[    0.300478] NET: Registered PF_INET6 protocol family
+[    0.300650] Segment Routing with IPv6
+[    0.300653] In-situ OAM (IOAM) with IPv6
+[    0.300670] NET: Registered PF_PACKET protocol family
+[    0.300678] Bridge firewalling registered
+[    0.300686] 9pnet: Installing 9P2000 support
+[    0.300718] NET: Registered PF_VSOCK protocol family
+[    0.301784] IPI shorthand broadcast: enabled
+[    0.301786] AVX2 version of gcm_enc/dec engaged.
+[    0.301834] AES CTR mode by8 optimization enabled
+[    0.302333] sched_clock: Marking stable (300589675, 1719672)->(312357486, -10048139)
+[    0.302363] Loading compiled-in X.509 certificates
+[    0.303045] Loaded X.509 cert 'Build time autogenerated kernel key: f00c4d25332faa9474d8352bfd7bcef2dc80192c'
+[    0.305496] EXT4-fs (vda1): mounted filesystem with ordered data mode. Quota mode: disabled.
+[    0.305502] VFS: Mounted root (ext4 filesystem) readonly on device 254:1.
+[    0.305637] devtmpfs: mounted
+[    0.305773] Freeing unused kernel image (initmem) memory: 964K
+[    0.317802] Write protecting the kernel read-only data: 18432k
+[    0.317975] Freeing unused kernel image (text/rodata gap) memory: 2044K
+[    0.318058] Freeing unused kernel image (rodata/data gap) memory: 1668K
+[    0.318062] Run /sbin/init as init process
+[    0.318063]   with arguments:
+[    0.318063]     /sbin/init
+[    0.318064]   with environment:
+[    0.318064]     HOME=/
+[    0.318064]     TERM=linux
+[    0.334205] systemd[1]: systemd 249.11-0ubuntu3 running in system mode (+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT +GNUTLS -OPENSSL +ACL +BLKID +CURL +ELFUTILS -FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP -LIBFDISK +PCRE2 -PWQUALITY -P11KIT -QRENCODE +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified)
+[    0.334270] systemd[1]: Detected virtualization kvm.
+[    0.334272] systemd[1]: Detected architecture x86-64.
+[    0.334684] systemd[1]: No hostname configured, using default hostname.
+[    0.334780] systemd[1]: Hostname set to <localhost>.
+[    0.366235] systemd[1]: Queued start job for default target Kata Containers Agent Target.
+[    0.368659] systemd[1]: Created slice Slice /system/modprobe.
+[    0.368716] systemd[1]: Started Dispatch Password Requests to Console Directory Watch.
+[    0.368797] systemd[1]: Set up automount Arbitrary Executable File Formats File System Automount Point.
+[    0.368804] systemd[1]: Reached target Local Encrypted Volumes.
+[    0.368810] systemd[1]: Reached target Path Units.
+[    0.368823] systemd[1]: Reached target Slice Units.
+[    0.368835] systemd[1]: Reached target Swaps.
+[    0.368840] systemd[1]: Reached target System Time Set.
+[    0.368851] systemd[1]: Reached target Local Verity Protected Volumes.
+[    0.368888] systemd[1]: Listening on initctl Compatibility Named Pipe.
+[    0.368956] systemd[1]: systemd-journald-audit.socket: Socket service systemd-journald.service not loaded, refusing.
+[    0.369067] systemd[1]: Failed to listen on Journal Audit Socket.
+[    0.369150] systemd[1]: Reached target Socket Units.
+[    0.369629] systemd[1]: Mounting Huge Pages File System...
+[    0.370066] systemd[134]: dev-hugepages.mount: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.370217] systemd[1]: Mounting POSIX Message Queue File System...
+[    0.370276] systemd[1]: Condition check resulted in Kernel Debug File System being skipped.
+[    0.370318] systemd[1]: Condition check resulted in Kernel Trace File System being skipped.
+[    0.370488] systemd[136]: dev-mqueue.mount: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.370923] systemd[1]: Mounting Temporary Directory /tmp...
+[    0.370955] systemd[1]: Condition check resulted in Create List of Static Device Nodes being skipped.
+[    0.371067] systemd[138]: tmp.mount: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.371510] systemd[1]: Starting Load Kernel Module configfs...
+[    0.372036] systemd[1]: Starting Load Kernel Module fuse...
+[    0.372266] systemd[139]: modprobe@configfs.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.372334] systemd[140]: modprobe@fuse.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.372862] systemd[1]: Starting Load Kernel Modules...
+[    0.372876] systemd[1]: Condition check resulted in Platform Persistent Storage Archival being skipped.
+[    0.372925] systemd[1]: Condition check resulted in Create System Users being skipped.
+[    0.373422] systemd[1]: Starting Create Static Device Nodes in /dev...
+[    0.373579] systemd[143]: systemd-tmpfiles-setup-dev.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.373713] systemd[142]: systemd-modules-load.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.374320] systemd[1]: Mounted Huge Pages File System.
+[    0.374371] systemd[1]: Mounted POSIX Message Queue File System.
+[    0.374411] systemd[1]: Mounted Temporary Directory /tmp.
+[    0.374487] systemd[1]: modprobe@configfs.service: Deactivated successfully.
+[    0.374669] systemd[1]: Finished Load Kernel Module configfs.
+[    0.374810] systemd[1]: modprobe@fuse.service: Deactivated successfully.
+[    0.374979] systemd[1]: Finished Load Kernel Module fuse.
+[    0.375046] systemd[1]: Reached target Local File Systems.
+[    0.375528] systemd[1]: Mounting FUSE Control File System...
+[    0.375583] systemd[1]: Condition check resulted in Kernel Configuration File System being skipped.
+[    0.375712] systemd[144]: sys-fs-fuse-connections.mount: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.376262] systemd[1]: Starting Set Up Additional Binary Formats...
+[    0.376275] systemd[1]: Condition check resulted in Store a System Token in an EFI Variable being skipped.
+[    0.376313] systemd[1]: Condition check resulted in Commit a transient machine-id on disk being skipped.
+[    0.376609] systemd[145]: systemd-binfmt.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.376998] systemd[1]: Finished Load Kernel Modules.
+[    0.377087] systemd[1]: Mounted FUSE Control File System.
+[    0.377573] systemd[1]: Starting Apply Kernel Variables...
+[    0.377717] systemd[146]: systemd-sysctl.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.378002] systemd[1]: Finished Create Static Device Nodes in /dev.
+[    0.378851] systemd[1]: Starting Rule-based Manager for Device Events and Files...
+[    0.378896] systemd[1]: proc-sys-fs-binfmt_misc.automount: Got automount request for /proc/sys/fs/binfmt_misc, triggered by 145 (systemd-binfmt)
+[    0.378986] systemd[147]: systemd-udevd.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.379512] systemd[1]: Mounting Arbitrary Executable File Formats File System...
+[    0.379676] systemd[148]: proc-sys-fs-binfmt_misc.mount: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.380571] systemd[1]: Finished Apply Kernel Variables.
+[    0.381025] systemd[1]: Mounted Arbitrary Executable File Formats File System.
+[    0.381626] systemd[1]: Finished Set Up Additional Binary Formats.
+[    0.399454] systemd[1]: Started Rule-based Manager for Device Events and Files.
+[    0.399533] systemd[1]: Reached target System Initialization.
+[    0.399571] systemd[1]: Started Daily Cleanup of Temporary Directories.
+[    0.399581] systemd[1]: Reached target Basic System.
+[    0.399614] systemd[1]: System is tainted: cgroupsv1
+[    0.399782] systemd[1]: Listening on D-Bus System Message Bus Socket.
+[    0.400782] systemd[1]: Starting chrony, an NTP client/server...
+[    0.401157] systemd[1]: Started Kata Containers Agent.
+[    0.401692] systemd[1]: Starting TENSTORRENT kata init...
+[    0.401913] systemd[152]: tenstorrent-kata-init.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[    0.415047] EXT4-fs (vda1): re-mounted. Quota mode: disabled.
+[    1.318608] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready
+[    3.413815] pci 0000:02:00.0: [1e52:401e] type 00 class 0x120000
+[    3.414292] pci 0000:02:00.0: reg 0x10: [mem 0x00000000-0x1fffffff 64bit pref]
+[    3.414361] pci 0000:02:00.0: reg 0x18: [mem 0x00000000-0x000fffff]
+[    3.414517] pci 0000:02:00.0: reg 0x20: [mem 0x00000000-0x01ffffff 64bit pref]
+[    3.414754] pci 0000:02:00.0: Max Payload Size set to 128 (was 512, max 1024)
+[    3.415713] pci 0000:02:00.0: supports D1
+[    3.417536] pci 0000:02:00.0: BAR 0: assigned [mem 0x383800000000-0x38381fffffff 64bit pref]
+[    3.417758] pci 0000:02:00.0: BAR 4: assigned [mem 0x383820000000-0x383821ffffff 64bit pref]
+[    3.418362] pci 0000:02:00.0: BAR 2: assigned [mem 0xfe400000-0xfe4fffff]
+[    3.418396] pcieport 0000:00:06.0: PCI bridge to [bus 02]
+[    3.418404] pcieport 0000:00:06.0:   bridge window [io  0x1000-0x1fff]
+[    3.420077] pcieport 0000:00:06.0:   bridge window [mem 0xfe400000-0xfe7fffff]
+[    3.420861] systemd[1]: Started chrony, an NTP client/server.
+[    3.420920] systemd[1]: Reached target System Time Synchronized.
+[    3.421154] pcieport 0000:00:06.0:   bridge window [mem 0x383800000000-0x383fffffffff 64bit pref]
+[    3.421764] systemd[1]: Started Daily apt download activities.
+[    3.421801] systemd[1]: Started Daily apt upgrade and clean activities.
+[    3.421816] systemd[1]: Started Daily dpkg database backup timer.
+[    3.421835] systemd[1]: Started Periodic ext4 Online Metadata Check for All Filesystems.
+[    3.421862] systemd[1]: Started Discard unused blocks once a week.
+[    3.421877] systemd[1]: Started Message of the Day.
+[    3.421884] systemd[1]: Reached target Timer Units.
+[    3.424060] tenstorrent: loading out-of-tree module taints kernel.
+[    3.424079] tenstorrent: module verification failed: signature and/or required key missing - tainting kernel
+[    3.424414] tenstorrent: unknown parameter 'async_reset' ignored
+[    3.424414] tenstorrent: unknown parameter 'init' ignored
+[    3.424434] Loading Tenstorrent AI driver module v2.6.0.
+[    3.424491] Found a Tenstorrent Wormhole device at bus 0000:02.
+[    3.424560] tenstorrent 0000:02:00.0: enabling device (0000 -> 0002)
+[    3.440345] systemd[1]: tenstorrent-kata-init.service: Deactivated successfully.
+[    3.440510] systemd[1]: Finished TENSTORRENT kata init.
+[    3.440560] systemd[1]: Reached target Kata Containers Agent Target.
+[    3.440636] systemd[1]: Startup finished in 326ms (kernel) + 3.112s (userspace) = 3.438s.
+[   10.431225] scsi 0:0:0:0: Direct-Access     QEMU     QEMU HARDDISK    2.5+ PQ: 0 ANSI: 5
+[   10.431578] sd 0:0:0:0: Power-on or device reset occurred
+[   10.431627] sd 0:0:0:0: LUN assignments on this target have changed. The Linux SCSI layer does not automatically remap LUN assignments.
+[   10.431696] sd 0:0:0:0: [sda] 1195376640 512-byte logical blocks: (612 GB/570 GiB)
+[   10.431715] sd 0:0:0:0: [sda] Write Protect is off
+[   10.431716] sd 0:0:0:0: [sda] Mode Sense: 63 00 10 08
+[   10.431754] sd 0:0:0:0: [sda] Write cache: enabled, read cache: enabled, supports DPO and FUA
+[   10.432307] sd 0:0:0:0: [sda] Attached SCSI disk
+[   10.462207] EXT4-fs (sda): mounted filesystem with ordered data mode. Quota mode: disabled.
+[   10.469553] kmem.limit_in_bytes is deprecated and will be removed. Writing any value to this file has no effect. Please report your usecase to linux-mm@kvack.org if you depend on this functionality.
+[  923.785801] systemd[1]: Starting Cleanup of Temporary Directories...
+[  923.786064] systemd[3156]: systemd-tmpfiles-clean.service: Failed to connect stdout to the journal socket, ignoring: No such file or directory
+[  923.789299] systemd[1]: systemd-tmpfiles-clean.service: Deactivated successfully.
+[  923.789459] systemd[1]: Finished Cleanup of Temporary Directories.
+[ 1675.556374] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1675.557533] docker0: port 1(vethc23a401) entered blocking state
+[ 1675.557536] docker0: port 1(vethc23a401) entered disabled state
+[ 1675.557555] device vethc23a401 entered promiscuous mode
+[ 1675.608944] eth0: renamed from vethd621511
+[ 1675.609572] IPv6: ADDRCONF(NETDEV_CHANGE): vethc23a401: link becomes ready
+[ 1675.609585] docker0: port 1(vethc23a401) entered blocking state
+[ 1675.609587] docker0: port 1(vethc23a401) entered forwarding state
+[ 1675.609597] IPv6: ADDRCONF(NETDEV_CHANGE): docker0: link becomes ready
+[ 1687.819615] docker0: port 1(vethc23a401) entered disabled state
+[ 1687.819632] vethd621511: renamed from eth0
+[ 1689.302163] docker0: port 1(vethc23a401) entered disabled state
+[ 1689.302624] device vethc23a401 left promiscuous mode
+[ 1689.302626] docker0: port 1(vethc23a401) entered disabled state
+[ 1689.333921] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1689.335898] docker0: port 1(veth9c110cb) entered blocking state
+[ 1689.335900] docker0: port 1(veth9c110cb) entered disabled state
+[ 1689.335928] device veth9c110cb entered promiscuous mode
+[ 1689.337503] docker0: port 1(veth9c110cb) entered blocking state
+[ 1689.337506] docker0: port 1(veth9c110cb) entered forwarding state
+[ 1689.337543] docker0: port 1(veth9c110cb) entered disabled state
+[ 1689.396874] eth0: renamed from veth0211065
+[ 1689.397800] IPv6: ADDRCONF(NETDEV_CHANGE): veth9c110cb: link becomes ready
+[ 1689.397819] docker0: port 1(veth9c110cb) entered blocking state
+[ 1689.397820] docker0: port 1(veth9c110cb) entered forwarding state
+[ 1700.836823] docker0: port 1(veth9c110cb) entered disabled state
+[ 1700.836849] veth0211065: renamed from eth0
+[ 1702.761739] docker0: port 1(veth9c110cb) entered disabled state
+[ 1702.762195] device veth9c110cb left promiscuous mode
+[ 1702.762197] docker0: port 1(veth9c110cb) entered disabled state
+[ 1702.802483] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.818583] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.836104] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.846721] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.860789] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.872522] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.885337] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.896352] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1702.897300] docker0: port 1(vethdf327e4) entered blocking state
+[ 1702.897302] docker0: port 1(vethdf327e4) entered disabled state
+[ 1702.897323] device vethdf327e4 entered promiscuous mode
+[ 1702.956600] eth0: renamed from vethbb2b576
+[ 1702.957054] IPv6: ADDRCONF(NETDEV_CHANGE): vethdf327e4: link becomes ready
+[ 1702.957069] docker0: port 1(vethdf327e4) entered blocking state
+[ 1702.957071] docker0: port 1(vethdf327e4) entered forwarding state
+[ 1710.586764] docker0: port 1(vethdf327e4) entered disabled state
+[ 1710.586821] vethbb2b576: renamed from eth0
+[ 1710.600242] docker0: port 1(vethdf327e4) entered disabled state
+[ 1710.600621] device vethdf327e4 left promiscuous mode
+[ 1710.600624] docker0: port 1(vethdf327e4) entered disabled state
+[ 1714.786953] docker0: port 1(veth4f182fc) entered blocking state
+[ 1714.786956] docker0: port 1(veth4f182fc) entered disabled state
+[ 1714.786989] device veth4f182fc entered promiscuous mode
+[ 1714.788206] overlayfs: disabling metacopy due to redirect_dir=off
+[ 1714.840365] eth0: renamed from vethd3ffa9c
+[ 1714.840715] IPv6: ADDRCONF(NETDEV_CHANGE): veth4f182fc: link becomes ready
+[ 1714.840732] docker0: port 1(veth4f182fc) entered blocking state
+[ 1714.840734] docker0: port 1(veth4f182fc) entered forwarding state
+[ 1722.520737] docker0: port 1(veth4f182fc) entered disabled state
+[ 1722.520856] vethd3ffa9c: renamed from eth0
+[ 1722.536052] docker0: port 1(veth4f182fc) entered disabled state
+[ 1722.536395] device veth4f182fc left promiscuous mode
+[ 1722.536397] docker0: port 1(veth4f182fc) entered disabled state
+[ 2341.866848] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2341.869928] docker0: port 1(vethaaa8c56) entered blocking state
+[ 2341.869932] docker0: port 1(vethaaa8c56) entered disabled state
+[ 2341.869959] device vethaaa8c56 entered promiscuous mode
+[ 2341.923082] eth0: renamed from veth6df7c4e
+[ 2341.923355] IPv6: ADDRCONF(NETDEV_CHANGE): vethaaa8c56: link becomes ready
+[ 2341.923368] docker0: port 1(vethaaa8c56) entered blocking state
+[ 2341.923369] docker0: port 1(vethaaa8c56) entered forwarding state
+[ 2353.143142] docker0: port 1(vethaaa8c56) entered disabled state
+[ 2353.143204] veth6df7c4e: renamed from eth0
+[ 2353.165476] docker0: port 1(vethaaa8c56) entered disabled state
+[ 2353.165753] device vethaaa8c56 left promiscuous mode
+[ 2353.165755] docker0: port 1(vethaaa8c56) entered disabled state
+[ 2359.543478] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2359.544779] docker0: port 1(vethf9508e1) entered blocking state
+[ 2359.544780] docker0: port 1(vethf9508e1) entered disabled state
+[ 2359.544799] device vethf9508e1 entered promiscuous mode
+[ 2359.598759] eth0: renamed from vethdfe9b7a
+[ 2359.598960] IPv6: ADDRCONF(NETDEV_CHANGE): vethf9508e1: link becomes ready
+[ 2359.598972] docker0: port 1(vethf9508e1) entered blocking state
+[ 2359.598974] docker0: port 1(vethf9508e1) entered forwarding state
+[ 2364.827047] docker0: port 1(vethf9508e1) entered disabled state
+[ 2364.827064] vethdfe9b7a: renamed from eth0
+[ 2364.845621] docker0: port 1(vethf9508e1) entered disabled state
+[ 2364.845793] device vethf9508e1 left promiscuous mode
+[ 2364.845795] docker0: port 1(vethf9508e1) entered disabled state
+[ 2372.211595] docker0: port 1(vethfe1185b) entered blocking state
+[ 2372.211598] docker0: port 1(vethfe1185b) entered disabled state
+[ 2372.211622] device vethfe1185b entered promiscuous mode
+[ 2372.215968] eth0: renamed from veth18973a0
+[ 2372.216268] IPv6: ADDRCONF(NETDEV_CHANGE): vethfe1185b: link becomes ready
+[ 2372.216278] docker0: port 1(vethfe1185b) entered blocking state
+[ 2372.216279] docker0: port 1(vethfe1185b) entered forwarding state
+[ 2372.243297] docker0: port 1(vethfe1185b) entered disabled state
+[ 2372.243312] veth18973a0: renamed from eth0
+[ 2372.273154] docker0: port 1(vethfe1185b) entered disabled state
+[ 2372.273272] device vethfe1185b left promiscuous mode
+[ 2372.273273] docker0: port 1(vethfe1185b) entered disabled state
+[ 2378.438334] docker0: port 1(veth0ac0b26) entered blocking state
+[ 2378.438337] docker0: port 1(veth0ac0b26) entered disabled state
+[ 2378.438386] device veth0ac0b26 entered promiscuous mode
+[ 2378.441296] eth0: renamed from veth68c5179
+[ 2378.441515] IPv6: ADDRCONF(NETDEV_CHANGE): veth0ac0b26: link becomes ready
+[ 2378.441528] docker0: port 1(veth0ac0b26) entered blocking state
+[ 2378.441529] docker0: port 1(veth0ac0b26) entered forwarding state
+[ 2378.473728] docker0: port 1(veth0ac0b26) entered disabled state
+[ 2378.473743] veth68c5179: renamed from eth0
+[ 2378.493903] docker0: port 1(veth0ac0b26) entered disabled state
+[ 2378.494079] device veth0ac0b26 left promiscuous mode
+[ 2378.494081] docker0: port 1(veth0ac0b26) entered disabled state
+[ 2383.374303] docker0: port 1(veth25c8791) entered blocking state
+[ 2383.374306] docker0: port 1(veth25c8791) entered disabled state
+[ 2383.374330] device veth25c8791 entered promiscuous mode
+[ 2383.377219] eth0: renamed from veth9524022
+[ 2383.377495] IPv6: ADDRCONF(NETDEV_CHANGE): veth25c8791: link becomes ready
+[ 2383.377508] docker0: port 1(veth25c8791) entered blocking state
+[ 2383.377509] docker0: port 1(veth25c8791) entered forwarding state
+[ 2383.421164] docker0: port 1(veth25c8791) entered disabled state
+[ 2383.421197] veth9524022: renamed from eth0
+[ 2383.441079] docker0: port 1(veth25c8791) entered disabled state
+[ 2383.441547] device veth25c8791 left promiscuous mode
+[ 2383.441550] docker0: port 1(veth25c8791) entered disabled state
+[ 2389.104955] docker0: port 1(veth5972812) entered blocking state
+[ 2389.104958] docker0: port 1(veth5972812) entered disabled state
+[ 2389.104978] device veth5972812 entered promiscuous mode
+[ 2389.110605] eth0: renamed from veth8ef695b
+[ 2389.110969] IPv6: ADDRCONF(NETDEV_CHANGE): veth5972812: link becomes ready
+[ 2389.110983] docker0: port 1(veth5972812) entered blocking state
+[ 2389.110984] docker0: port 1(veth5972812) entered forwarding state
+[ 2389.147548] docker0: port 1(veth5972812) entered disabled state
+[ 2389.147569] veth8ef695b: renamed from eth0
+[ 2389.173817] docker0: port 1(veth5972812) entered disabled state
+[ 2389.173949] device veth5972812 left promiscuous mode
+[ 2389.173951] docker0: port 1(veth5972812) entered disabled state
+[ 2395.245006] docker0: port 1(veth7041430) entered blocking state
+[ 2395.245009] docker0: port 1(veth7041430) entered disabled state
+[ 2395.245028] device veth7041430 entered promiscuous mode
+[ 2395.247345] eth0: renamed from vethc492034
+[ 2395.247571] IPv6: ADDRCONF(NETDEV_CHANGE): veth7041430: link becomes ready
+[ 2395.247582] docker0: port 1(veth7041430) entered blocking state
+[ 2395.247583] docker0: port 1(veth7041430) entered forwarding state
+[ 2395.288111] docker0: port 1(veth7041430) entered disabled state
+[ 2395.288157] vethc492034: renamed from eth0
+[ 2395.313044] docker0: port 1(veth7041430) entered disabled state
+[ 2395.313192] device veth7041430 left promiscuous mode
+[ 2395.313193] docker0: port 1(veth7041430) entered disabled state
+[ 2407.157601] docker0: port 1(veth00d7bcd) entered blocking state
+[ 2407.157604] docker0: port 1(veth00d7bcd) entered disabled state
+[ 2407.157623] device veth00d7bcd entered promiscuous mode
+[ 2407.162683] eth0: renamed from vethc9a2720
+[ 2407.163507] IPv6: ADDRCONF(NETDEV_CHANGE): veth00d7bcd: link becomes ready
+[ 2407.163521] docker0: port 1(veth00d7bcd) entered blocking state
+[ 2407.163523] docker0: port 1(veth00d7bcd) entered forwarding state
+[ 2407.190129] docker0: port 1(veth00d7bcd) entered disabled state
+[ 2407.190168] vethc9a2720: renamed from eth0
+[ 2407.224878] docker0: port 1(veth00d7bcd) entered disabled state
+[ 2407.225149] device veth00d7bcd left promiscuous mode
+[ 2407.225151] docker0: port 1(veth00d7bcd) entered disabled state
+[ 2430.974219] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2430.974454] docker0: port 1(veth4af3497) entered blocking state
+[ 2430.974456] docker0: port 1(veth4af3497) entered disabled state
+[ 2430.974477] device veth4af3497 entered promiscuous mode
+[ 2431.037454] eth0: renamed from veth7263a01
+[ 2431.037884] IPv6: ADDRCONF(NETDEV_CHANGE): veth4af3497: link becomes ready
+[ 2431.037897] docker0: port 1(veth4af3497) entered blocking state
+[ 2431.037899] docker0: port 1(veth4af3497) entered forwarding state
+[ 2438.825897] docker0: port 1(veth4af3497) entered disabled state
+[ 2438.825921] veth7263a01: renamed from eth0
+[ 2440.416487] docker0: port 1(veth4af3497) entered disabled state
+[ 2440.416653] device veth4af3497 left promiscuous mode
+[ 2440.416655] docker0: port 1(veth4af3497) entered disabled state
+[ 2440.441325] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.459825] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.475642] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.488964] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.503536] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.516975] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.528917] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.541232] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2440.541841] docker0: port 1(vethe52bda3) entered blocking state
+[ 2440.541843] docker0: port 1(vethe52bda3) entered disabled state
+[ 2440.541863] device vethe52bda3 entered promiscuous mode
+[ 2440.543211] docker0: port 1(vethe52bda3) entered blocking state
+[ 2440.543215] docker0: port 1(vethe52bda3) entered forwarding state
+[ 2440.543259] docker0: port 1(vethe52bda3) entered disabled state
+[ 2440.601250] eth0: renamed from veth639bff0
+[ 2440.601575] IPv6: ADDRCONF(NETDEV_CHANGE): vethe52bda3: link becomes ready
+[ 2440.601588] docker0: port 1(vethe52bda3) entered blocking state
+[ 2440.601589] docker0: port 1(vethe52bda3) entered forwarding state
+[ 2458.900707] docker0: port 1(vethe52bda3) entered disabled state
+[ 2458.900776] veth639bff0: renamed from eth0
+[ 2458.913330] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2458.929741] docker0: port 2(vethdd0344a) entered blocking state
+[ 2458.929745] docker0: port 2(vethdd0344a) entered disabled state
+[ 2458.929768] device vethdd0344a entered promiscuous mode
+[ 2458.931648] docker0: port 2(vethdd0344a) entered blocking state
+[ 2458.931651] docker0: port 2(vethdd0344a) entered forwarding state
+[ 2458.939178] docker0: port 1(vethe52bda3) entered disabled state
+[ 2458.939494] device vethe52bda3 left promiscuous mode
+[ 2458.939496] docker0: port 1(vethe52bda3) entered disabled state
+[ 2458.985094] eth0: renamed from veth5d03484
+[ 2458.985311] IPv6: ADDRCONF(NETDEV_CHANGE): vethdd0344a: link becomes ready
+[ 2464.503548] docker0: port 2(vethdd0344a) entered disabled state
+[ 2464.503583] veth5d03484: renamed from eth0
+[ 2464.521618] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.524785] docker0: port 2(vethdd0344a) entered disabled state
+[ 2464.525166] device vethdd0344a left promiscuous mode
+[ 2464.525168] docker0: port 2(vethdd0344a) entered disabled state
+[ 2464.534164] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.555357] docker0: port 1(veth16b726e) entered blocking state
+[ 2464.555364] docker0: port 1(veth16b726e) entered disabled state
+[ 2464.555402] device veth16b726e entered promiscuous mode
+[ 2464.558643] docker0: port 1(veth16b726e) entered blocking state
+[ 2464.558647] docker0: port 1(veth16b726e) entered forwarding state
+[ 2464.609144] eth0: renamed from veth8a48abd
+[ 2464.609427] IPv6: ADDRCONF(NETDEV_CHANGE): veth16b726e: link becomes ready
+[ 2464.636897] docker0: port 1(veth16b726e) entered disabled state
+[ 2464.636950] veth8a48abd: renamed from eth0
+[ 2464.676897] docker0: port 1(veth16b726e) entered disabled state
+[ 2464.677153] device veth16b726e left promiscuous mode
+[ 2464.677154] docker0: port 1(veth16b726e) entered disabled state
+[ 2464.693451] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.695369] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.698801] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.700699] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.702882] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.704727] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.707241] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.709269] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.718375] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.718891] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.723328] overlayfs: disabling metacopy due to redirect_dir=off
+[ 2464.740679] overlayfs: disabling metacopy due to redirect_dir=off
