@@ -3158,10 +3158,10 @@ static float* forward_decode() {
             auto t_after_read = Clock::now();
             g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
 
-            // Write hidden to chip 1
+            // Write hidden to chip 1 (non-blocking; chip1's CQ ordering guarantees
+            // the write completes before any later chip1 FFN trace executes)
             if (g_mesh1) {
                 write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                Finish(g_mesh1->mesh_command_queue());
             }
 
             g_hang_layer.store(layer, std::memory_order_relaxed);
@@ -3447,10 +3447,10 @@ static float* forward_decode() {
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
 
-            // Write hidden to chip 1 synchronously
+            // Write hidden to chip 1 (non-blocking; chip1's CQ ordering guarantees
+            // the write completes before any later chip1 FFN trace executes)
             if (g_mesh1) {
                 write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                Finish(g_mesh1->mesh_command_queue());
             }
 
             g_hang_layer.store(layer, std::memory_order_relaxed);
