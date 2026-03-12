@@ -72,9 +72,9 @@ TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
 
 ## Measuring decode speed
 
-The `test_tok_per_sec` test estimates decode tok/s by subtracting estimated prefill
-time from total generate() wall time. This estimate can be inaccurate — use
-`test_basic_generation` output instead for a reliable decode measurement:
+The `test_tok_per_sec` test measures decode tok/s by subtracting the actual prefill
+time (from `get_last_prefill_ms()`) from total generate() wall time. For a quick
+visual check, use `test_basic_generation` output:
 
 ```
 test_basic_generation...
@@ -96,9 +96,13 @@ line gives actual prefill time. Do NOT hardcode a ms/tok estimate for prefill
 subtraction — batched prefill (~33ms/tok) is very different from single-token
 (~120ms/tok), and short prompts don't batch well (~73ms/tok for <32 tokens).
 
-Current baselines (as of 2026-03-10):
-- **Decode**: ~8.4 tok/s (119ms/tok)
-- **Prefill**: ~30 tok/s (33ms/tok, batched)
+Current baselines (as of 2026-03-12, 4-CPU container):
+- **Decode**: ~4.5 tok/s (215ms/tok avg, 190ms/tok best steady-state)
+- **Prefill**: ~17 tok/s (58ms/tok, batched)
+
+Note: performance depends heavily on available CPU cores. The engine uses a 4-thread
+worker pool for host-side deltanet/attention, and PCIe DMA coordination benefits from
+low CPU contention. Bare-metal 24-core achieves ~8 tok/s decode.
 
 ## Debugging hangs
 

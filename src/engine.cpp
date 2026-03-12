@@ -65,6 +65,7 @@ static Tokenizer g_tokenizer;
 static bool g_loaded = false;
 static bool g_verbose = true;  // set false via QUIET=1 env var
 static bool g_no_traces = false;  // set true via NO_TRACES=1 to disable trace replay (debug)
+static double g_last_prefill_ms = 0;  // actual prefill time from last generate() call
 static int g_max_ctx = 0;
 static int g_pos = 0;
 
@@ -4118,6 +4119,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
+    g_last_prefill_ms = prefill_ms;
     printf("  [prefill: %.1f ms for %d new tokens (%.1f ms/tok)]\n",
            prefill_ms, new_tokens, new_tokens > 0 ? prefill_ms / new_tokens : 0.0);
 
@@ -4180,6 +4182,10 @@ const Tokenizer& get_tokenizer() {
 void get_hang_info(int& layer, int& op) {
     layer = g_hang_layer.load(std::memory_order_relaxed);
     op = g_hang_op.load(std::memory_order_relaxed);
+}
+
+double get_last_prefill_ms() {
+    return g_last_prefill_ms;
 }
 
 void shutdown() {

@@ -85,3 +85,6 @@ const Tokenizer& get_tokenizer();
 // Hang diagnostic: returns last layer and operation before a blocking device call.
 // op: 1=norm_mm_read, 2=ffn_wait, 3=tp_read, 4=lmhead_read
 void get_hang_info(int& layer, int& op);
+
+// Returns actual prefill time (ms) from the last generate() call.
+double get_last_prefill_ms();

@@ -276,16 +276,14 @@ static void test_tok_per_sec() {
     auto t1 = std::chrono::high_resolution_clock::now();
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // Subtract estimated prefill time: prompt is ~20 tokens at ~35ms/tok (batched prefill)
-    auto& tok = get_tokenizer();
-    int n_prompt = (int)tok.encode(prompt).size();
-    double est_prefill_ms = n_prompt * 35.0;
-    double decode_ms = ms - est_prefill_ms;
+    // Subtract actual prefill time measured by the engine
+    double prefill_ms = get_last_prefill_ms();
+    double decode_ms = ms - prefill_ms;
     if (decode_ms < 1.0) decode_ms = ms;  // fallback
     double tok_per_sec = (n > 0 && decode_ms > 0) ? n * 1000.0 / decode_ms : 0;
 
-    printf("    %d tokens in %.1f ms total (est decode: %.1f ms) = %.1f tok/s\n",
-           n, ms, decode_ms, tok_per_sec);
+    printf("    %d tokens in %.1f ms total (prefill: %.1f ms, decode: %.1f ms) = %.1f tok/s\n",
+           n, ms, prefill_ms, decode_ms, tok_per_sec);
 
     EXPECT_TRUE(n >= 16);  // should generate at least 16 tokens
 
