@@ -4,6 +4,8 @@ Custom inference engine for [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
 
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=qwen3-5-9b-n300&type=docker&image=ghcr.io%2Fvibekernels%2Fqwen3.5-9b-bfp8b-1xn300:latest&instance_type=gpu-tenstorrent-n300s&regions=na&instances_min=1&hc_grace_period%5B8888%5D=900&ports=8888;http;/&ports=22;tcp;;true;tcp&env%5BPUBLIC_KEY%5D=REPLACE_ME)
 
+https://github.com/user-attachments/assets/f9da983a-4178-4ab0-b22a-7cbaa2b7cf8e
+
 ## Performance
 
 Measured on a Tenstorrent N300 (2x Wormhole) in a 4-CPU container. The first few tokens are slower while Metal Traces are captured; subsequent tokens run at steady state.
